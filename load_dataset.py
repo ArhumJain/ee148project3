@@ -88,4 +88,4 @@ def download_and_load_data(
     print("All Google Drive links failed. Falling back to HuggingFace...")
     return load_data_from_huggingface()
 
-data: list[dict] = download_and_load_data()
+items: list[dict] = download_and_load_data()
