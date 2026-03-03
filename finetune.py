@@ -32,7 +32,7 @@ print("Using device:", DEVICE)
 
 # ── Config ──
 NUM_CLASSES = 10
-PRETRAINED_PATH = "checkpoints/pretrain_tiny_imagenet/best.pt"
+PRETRAINED_PATH = "checkpoints/pretrain_tiny_imagenet224/best.pt"
 
 # ── Train / val split (same 80/20 seeded split as main.py) ──
 num_samples = len(items)
@@ -79,7 +79,7 @@ def collate_fn(batch):
     return cutmix_or_mixup(*default_collate(batch))
 
 BATCH_SIZE  = 64
-NUM_WORKERS = 4
+NUM_WORKERS = 24
 
 train_loader = DataLoader(
     train_dataset,
@@ -89,7 +89,8 @@ train_loader = DataLoader(
     collate_fn=collate_fn,
     persistent_workers=True,
     drop_last=True,
-    pin_memory=False,
+    pin_memory=True,
+    prefetch_factor=4,
 )
 
 val_loader = DataLoader(
@@ -99,7 +100,8 @@ val_loader = DataLoader(
     num_workers=NUM_WORKERS,
     persistent_workers=True,
     drop_last=False,
-    pin_memory=False,
+    pin_memory=True,
+    prefetch_factor=4,
 )
 
 # ── Model: load pretrained, swap head ──
