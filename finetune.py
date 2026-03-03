@@ -138,9 +138,9 @@ def unfreeze_all(model):
 head_lr = 1e-3           # higher LR for randomly initialized head
 finetune_lr = 2e-4       # lower LR for pretrained backbone
 weight_decay = 0.05
-epochs = 150
+epochs = 400
 warm_up_period = 5       # LR warmup within finetune phase
-patience = 40
+patience = 100
 patience_delta = 0.0
 
 # ── Weight decay groups ──

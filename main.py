@@ -39,7 +39,7 @@ class ClassImages(Dataset):
             return image, label
 
 
-TARGET = 128
+TARGET = 224
 
 def make_uniform_compose(target=TARGET, fill=0):
     # make all dimensions and aspect ratios uniform (1:1 aspect ratio, 128x128)

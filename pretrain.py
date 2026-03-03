@@ -40,10 +40,8 @@ val_idx   = perm[num_train:]
 
 # ── Compute mean/std on training split ──
 # Set to None to force recomputation, or paste cached values here
-# mean = None
-# std  = None
-mean = [0.4803290367126465, 0.4481673836708069, 0.39773645997047424]
-std  = [0.2713068723678589, 0.26363784074783325, 0.27669447660446167]
+mean = None
+std  = None
 
 if mean is not None and std is not None:
     print("Using cached Tiny ImageNet mean/std.")
@@ -109,9 +107,9 @@ print(f"CoAtNet-0 parameters: {num_params:,}")
 # ── Hyperparameters ──
 lr = 1e-3
 weight_decay = 0.05
-epochs = 90
+epochs = 200
 warm_up_period = 5
-patience = 30
+patience = 70
 patience_delta = 0.0
 
 # ── Optimizer with proper weight decay groups ──
@@ -149,7 +147,7 @@ scheduler = torch.optim.lr_scheduler.SequentialLR(
 )
 
 # ── Checkpointing ──
-checkpoint_dir = "checkpoints/pretrain_tiny_imagenet"
+checkpoint_dir = "checkpoints/pretrain_tiny_imagenet224"
 best_path   = os.path.join(checkpoint_dir, "best.pt")
 latest_path = os.path.join(checkpoint_dir, "last.pt")
 
