@@ -3,3 +3,5 @@ checkpoints/pretrain_tiny_imagenet/best.pt filter=lfs diff=lfs merge=lfs -text
 checkpoints/pretrain_tiny_imagenet/last.pt filter=lfs diff=lfs merge=lfs -text
 checkpoints/pretrain_tiny_imagenet224/best.pt filter=lfs diff=lfs merge=lfs -text
 checkpoints/pretrain_tiny_imagenet224/last.pt filter=lfs diff=lfs merge=lfs -text
+checkpoints/finetune224/best.pt filter=lfs diff=lfs merge=lfs -text
+checkpoints/finetune224/last.pt filter=lfs diff=lfs merge=lfs -text
