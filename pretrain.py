@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from torchvision.transforms import v2
 from torch.utils.data import DataLoader, Subset, default_collate
 import os
+import json
 from tqdm import tqdm
 
 from load_tiny_imagenet import items_tiny_imagenet
@@ -170,7 +171,17 @@ def load_checkpoint(path, model, optimizer, scheduler, device):
         optimizer.load_state_dict(ckpt["optimizer"])
     if scheduler is not None and ckpt.get("scheduler") is not None:
         scheduler.load_state_dict(ckpt["scheduler"])
-    return ckpt.get("epoch", -1) + 1, ckpt.get("best_val_acc", 0.0)
+    return ckpt.get("epoch", -1) + 1, ckpt.get("best_val_acc", 0.0), ckpt.get("history")
+
+# ── Epoch history ──
+history = {
+    "train_loss": [],
+    "train_acc": [],
+    "val_loss": [],
+    "val_acc": [],
+    "lr": [],
+}
+history_path = os.path.join(checkpoint_dir, "history.json")
 
 # ── Resume from checkpoint if available ──
 start_epoch = 0
@@ -180,9 +191,11 @@ failing_epochs = 0
 resume_path = latest_path if os.path.isfile(latest_path) else None
 
 if resume_path is not None:
-    start_epoch, best_val_acc = load_checkpoint(
+    start_epoch, best_val_acc, saved_history = load_checkpoint(
         resume_path, model, optimizer, scheduler, device=DEVICE
     )
+    if saved_history is not None:
+        history = saved_history
     print(f"Resuming from epoch {start_epoch}, best_val_acc={best_val_acc:.4f}")
 
 # ── Training loop ──
@@ -236,25 +249,38 @@ for epoch in range(start_epoch, epochs):
     avg_val_loss = val_loss_sum / val_total
     current_lr = scheduler.get_last_lr()[0]
 
+    # ── Record history ──
+    history["train_loss"].append(avg_train_loss)
+    history["train_acc"].append(train_acc)
+    history["val_loss"].append(avg_val_loss)
+    history["val_acc"].append(val_acc)
+    history["lr"].append(current_lr)
+
     print(f"Epoch {epoch+1:3d}/{epochs} | "
           f"lr {current_lr:.2e} | "
           f"train_loss {avg_train_loss:.4f} | train_acc {train_acc:.4f} | "
           f"val_loss {avg_val_loss:.4f} | val_acc {val_acc:.4f}")
 
     # ── Checkpointing ──
+    ckpt_extra = {"val_acc": val_acc, "history": history}
+
     if val_acc > (best_val_acc + patience_delta):
         best_val_acc = val_acc
         failing_epochs = 0
         save_checkpoint(best_path, model, optimizer, scheduler,
                         epoch=epoch, best_val_acc=best_val_acc,
-                        extra={"val_acc": val_acc})
+                        extra=ckpt_extra)
         print(f"  -> Saved new best (val_acc={val_acc:.4f})")
     else:
         failing_epochs += 1
 
     save_checkpoint(latest_path, model, optimizer, scheduler,
                     epoch=epoch, best_val_acc=best_val_acc,
-                    extra={"val_acc": val_acc})
+                    extra=ckpt_extra)
+
+    # Save history as standalone JSON for easy plotting without loading the checkpoint
+    with open(history_path, "w") as f:
+        json.dump(history, f, indent=2)
 
     if failing_epochs >= patience:
         print(f"Early stopping at epoch {epoch+1}, best={best_val_acc:.4f}")
@@ -262,3 +288,4 @@ for epoch in range(start_epoch, epochs):
 
 print(f"\nPretraining complete. Best val_acc: {best_val_acc:.4f}")
 print(f"Best weights: {best_path}")
+print(f"History:      {history_path}")

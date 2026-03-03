@@ -678,93 +678,96 @@ if resume_path is not None:
     )
     print(f"Resuming from epoch {start_epoch}, best_val_acc={best_val_acc:.4f}")
 
-for epoch in range(start_epoch, epochs):
-    print(f"Training Epoch {epoch}/{epochs}")
-    final_loss = None
-    total_count = 0
-    correct_count = 0
-    model.train()
-    for images, labels in train_loader:
-        images = images.to(DEVICE, non_blocking=True)
-        labels = labels.to(DEVICE, non_blocking=True)
-        if (labels.shape == (BATCH_SIZE,)):
-            labels = F.one_hot(labels, 10).float()
-        optimizer.zero_grad() # necessary for training
-        if len(train_losses) < 2:
-            print(f"Labels shape {labels.shape}")
-        outputs = model(images)
-        # loss = criterion(outputs.squeeze(), labels)
-        # loss = soft_target_cross_entropy(outputs, labels)
-        loss = F.cross_entropy(outputs, labels)
+TRAIN = False
 
-        train_losses.append(loss.item())
-
-        loss.backward()
-        optimizer.step()
-
-        final_loss = loss.item()
-        correct_count += (outputs.argmax(dim=1) == labels.argmax(dim=1)).sum().item()
-        total_count += len(labels)
-    train_accuracies.append(correct_count/total_count)
-    print(f"Train loss: {final_loss}")
-    print(f"Train accuracy: {correct_count/total_count}")
-
-    final_loss = None
-    total_count = 0
-    total_loss_sum = 0
-    correct_count = 0
-    model.eval()
-
-    with torch.no_grad():
-        for images, labels in val_loader:
+if TRAIN:
+    for epoch in range(start_epoch, epochs):
+        print(f"Training Epoch {epoch}/{epochs}")
+        final_loss = None
+        total_count = 0
+        correct_count = 0
+        model.train()
+        for images, labels in train_loader:
             images = images.to(DEVICE, non_blocking=True)
             labels = labels.to(DEVICE, non_blocking=True)
-
+            if (labels.shape == (BATCH_SIZE,)):
+                labels = F.one_hot(labels, 10).float()
+            optimizer.zero_grad() # necessary for training
+            if len(train_losses) < 2:
+                print(f"Labels shape {labels.shape}")
             outputs = model(images)
-            # loss = val_criterion(outputs.squeeze(), labels)
+            # loss = criterion(outputs.squeeze(), labels)
             # loss = soft_target_cross_entropy(outputs, labels)
             loss = F.cross_entropy(outputs, labels)
 
-            total_loss_sum += loss.item() * len(labels)
-            correct_count += (outputs.argmax(dim=1) == labels).sum().item()
+            train_losses.append(loss.item())
+
+            loss.backward()
+            optimizer.step()
+
+            final_loss = loss.item()
+            correct_count += (outputs.argmax(dim=1) == labels.argmax(dim=1)).sum().item()
             total_count += len(labels)
+        train_accuracies.append(correct_count/total_count)
+        print(f"Train loss: {final_loss}")
+        print(f"Train accuracy: {correct_count/total_count}")
 
-    val_accuracies.append(correct_count/total_count)
-    final_loss = total_loss_sum/total_count
-    val_losses.append(final_loss)
-    print(f"Validation loss: {final_loss}")
-    print(f"Validation accuracy: {correct_count/total_count}")
+        final_loss = None
+        total_count = 0
+        total_loss_sum = 0
+        correct_count = 0
+        model.eval()
+
+        with torch.no_grad():
+            for images, labels in val_loader:
+                images = images.to(DEVICE, non_blocking=True)
+                labels = labels.to(DEVICE, non_blocking=True)
+
+                outputs = model(images)
+                # loss = val_criterion(outputs.squeeze(), labels)
+                # loss = soft_target_cross_entropy(outputs, labels)
+                loss = F.cross_entropy(outputs, labels)
+
+                total_loss_sum += loss.item() * len(labels)
+                correct_count += (outputs.argmax(dim=1) == labels).sum().item()
+                total_count += len(labels)
+
+        val_accuracies.append(correct_count/total_count)
+        final_loss = total_loss_sum/total_count
+        val_losses.append(final_loss)
+        print(f"Validation loss: {final_loss}")
+        print(f"Validation accuracy: {correct_count/total_count}")
 
 
-    if scheduler is not None:
-        scheduler.step()
-        print(f"Learning rate: {scheduler.get_last_lr()}")
+        if scheduler is not None:
+            scheduler.step()
+            print(f"Learning rate: {scheduler.get_last_lr()}")
 
-    val_acc = val_accuracies[-1]
+        val_acc = val_accuracies[-1]
 
-    if val_acc > (best_val_acc + patience_delta):
-        best_val_acc = val_acc
-        failing_epochs = 0
+        if val_acc > (best_val_acc + patience_delta):
+            best_val_acc = val_acc
+            failing_epochs = 0
+            save_checkpoint(
+                best_acc_path,
+                model, optimizer, scheduler,
+                epoch=epoch,
+                best_val_acc=best_val_acc,
+                extra={"val_acc": val_acc}
+            )
+            print(f"Saved new best validation accuracy: {best_val_acc:.4f} at epoch {epoch}")
+        else:
+            failing_epochs += 1
+
         save_checkpoint(
-            best_acc_path,
+            latest_path,
             model, optimizer, scheduler,
             epoch=epoch,
             best_val_acc=best_val_acc,
             extra={"val_acc": val_acc}
         )
-        print(f"Saved new best validation accuracy: {best_val_acc:.4f} at epoch {epoch}")
-    else:
-        failing_epochs += 1
 
-    save_checkpoint(
-        latest_path,
-        model, optimizer, scheduler,
-        epoch=epoch,
-        best_val_acc=best_val_acc,
-        extra={"val_acc": val_acc}
-    )
-
-    if failing_epochs >= patience:
-        print(f"Early stopping at epoch {epoch}, best={best_val_acc:.4f}")
-        break
+        if failing_epochs >= patience:
+            print(f"Early stopping at epoch {epoch}, best={best_val_acc:.4f}")
+            break
 
