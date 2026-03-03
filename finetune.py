@@ -164,7 +164,7 @@ def get_decay_param_groups(model, weight_decay, lr):
     ]
 
 # ── Checkpointing ──
-checkpoint_dir = "checkpoints/finetune"
+checkpoint_dir = "checkpoints/finetune224"
 best_path   = os.path.join(checkpoint_dir, "best.pt")
 latest_path = os.path.join(checkpoint_dir, "last.pt")
 
