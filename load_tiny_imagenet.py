@@ -95,3 +95,4 @@ def load_tiny_imagenet_items():
 # When imported, produce the items list
 items_tiny_imagenet = load_tiny_imagenet_items()
 print(f"[tiny-imagenet] Loaded {len(items_tiny_imagenet)} items, 200 classes.")
+print(items_tiny_imagenet)

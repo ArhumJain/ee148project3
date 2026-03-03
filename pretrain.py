@@ -40,8 +40,10 @@ val_idx   = perm[num_train:]
 
 # ── Compute mean/std on training split ──
 # Set to None to force recomputation, or paste cached values here
-mean = None
-std  = None
+# mean = None
+# std  = None
+mean = [0.4803290367126465, 0.4481673836708069, 0.39773645997047424]
+std  = [0.2713068723678589, 0.26363784074783325, 0.27669447660446167]
 
 if mean is not None and std is not None:
     print("Using cached Tiny ImageNet mean/std.")
