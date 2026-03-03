@@ -78,7 +78,7 @@ def collate_fn(batch):
     return cutmix_or_mixup(*default_collate(batch))
 
 BATCH_SIZE  = 128
-NUM_WORKERS = 4
+NUM_WORKERS = 24
 
 train_loader = DataLoader(
     train_dataset,
@@ -88,7 +88,7 @@ train_loader = DataLoader(
     collate_fn=collate_fn,
     persistent_workers=True,
     drop_last=True,
-    pin_memory=False,
+    pin_memory=True,
 )
 
 val_loader = DataLoader(
@@ -98,7 +98,7 @@ val_loader = DataLoader(
     num_workers=NUM_WORKERS,
     persistent_workers=True,
     drop_last=False,
-    pin_memory=False,
+    pin_memory=True,
 )
 
 # ── Model ──
