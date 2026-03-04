@@ -10,7 +10,7 @@ load_hf_info = {
     'username': 'Isukali',
     'token': 'REDACTED',
     'repo_name': 'ee148a-project',
-    'filename': 'pipeline-cnn.pt'
+    'filename': 'pipeline-vit.pt'
 }
 
 model_path = hf_hub_download(
