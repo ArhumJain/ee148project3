@@ -10,7 +10,6 @@ from torchvision.transforms import InterpolationMode
 from torch.utils.data import Subset
 import os
 import json
-from load_dataset import items
 from PIL import Image
 
 cuda_available = torch.cuda.is_available()
@@ -42,7 +41,7 @@ class ClassImages(Dataset):
 TARGET = 224
 
 def make_uniform_compose(target=TARGET, fill=0):
-    # make all dimensions and aspect ratios uniform (1:1 aspect ratio, 128x128)
+    # make all dimensions and aspect ratios uniform (1:1 aspect ratio)
     def resize_long_side(img):
         w, h = img.size
         if w >= h:
@@ -68,17 +67,14 @@ def make_uniform_compose(target=TARGET, fill=0):
         T.ToTensor(),
     ])
 
-# compute the mean and std of
 @torch.no_grad()
 def compute_mean_std(train_dataset, batch_size=64, num_workers=8, device="cuda"):
     """
     Computes channel-wise mean/std on the *training* set after uniformization.
     Assumes train_dataset returns (tensor_image, label) and its transform is set.
     """
-
-    # At this point train_dataset employs the transform pipeline in the above function which makes all inputs uniform
     loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False,
-                        num_workers=num_workers, pin_memory=False, persistent_workers=True, prefetch_factor=4)
+                        num_workers=num_workers, pin_memory=False, persistent_workers=(num_workers > 0), prefetch_factor=( 4 if num_workers > 0 else None))
 
     channel_sum = torch.zeros(3, device=device)
     channel_sumsq = torch.zeros(3, device=device)
@@ -119,7 +115,6 @@ def get_or_compute_mean_std(train_subset,
                                  num_workers=num_workers, device=device)
     return mean, std
 
-# returns the transform composition of the uniformization process from above + normalization with datset mean and std
 def make_final_compose(mean, std, target=TARGET, fill=0):
     def resize_long_side(img):
         w, h = img.size
@@ -146,9 +141,6 @@ def make_final_compose(mean, std, target=TARGET, fill=0):
         T.Normalize(mean=mean, std=std),
     ])
 
-# generate transformation pipeline just for train dataloader
-# this does uniformization + normalization as above but also adds random augmentation transforms
-# this processing transform is critical for improve generalizability and validation accuracy
 def make_augment_compose(mean, std, target=TARGET, fill=0):
     def resize_long_side(img):
         w, h = img.size
@@ -192,89 +184,18 @@ def make_augment_compose(mean, std, target=TARGET, fill=0):
         # Keep erased blocks small as this can lead to digit being unrecognizable
         T.RandomErasing(0.2, scale=(0.01, 0.05)),
 
-
         T.Normalize(mean=mean, std=std),
     ])
 
-dataset = ClassImages(
-    items=items,
-    transform=None
-)
 
-train_fraction = 0.8 # ... # how much of your data do you want to use for training, and how much do you want to save for validation?
-num_samples = len(dataset)
-
-num_train = int(train_fraction * num_samples)
-num_val = num_samples - num_train
-
-g = torch.Generator().manual_seed(42)
-permutations = torch.randperm(num_samples, generator=g).tolist()
-train_idx = permutations[:num_train]
-val_idx   = permutations[num_train:]
-
-uniform_only = make_uniform_compose(TARGET)
-stats_dataset = ClassImages(items=items, transform=uniform_only)
-subset_for_stats = Subset(stats_dataset, train_idx)
-
-mean, std = get_or_compute_mean_std(subset_for_stats, batch_size=256, device=str(DEVICE))
-print(f"Mean: {mean}")
-print(f"Std: {std}")
-
-final_tfms   = make_final_compose(mean, std, target=TARGET)
-augment_tfms = make_augment_compose(mean, std, target=TARGET)
-
-train_base_dataset = ClassImages(items=items, transform=augment_tfms)
-val_base_dataset   = ClassImages(items=items, transform=final_tfms)
-
-train_dataset = Subset(train_base_dataset, train_idx)
-val_dataset   = Subset(val_base_dataset, val_idx)
-
-from torchvision.transforms import v2
-from torch.utils.data import default_collate
-
-mixup = v2.MixUp(alpha=0.2, num_classes=10)
-cutmix = v2.CutMix(num_classes=10)
-cutmix_or_mixup = v2.RandomChoice([cutmix, mixup])
-
-def collate_fn(batch):
-    return cutmix_or_mixup(*default_collate(batch))
-
-BATCH_SIZE = 128     # Consider adjusting
-NUM_WORKERS = 4
-
-train_loader = DataLoader(
-    train_dataset,
-    batch_size=BATCH_SIZE,
-    shuffle=True,
-    num_workers=NUM_WORKERS,
-    collate_fn=collate_fn,
-    persistent_workers=True,
-    drop_last=True,
-    pin_memory=False
-)
-
-val_loader = DataLoader(
-    val_dataset,
-    batch_size=BATCH_SIZE,
-    shuffle=False,
-    num_workers=NUM_WORKERS,
-    persistent_workers=True,
-    drop_last=False,
-    pin_memory=False
-)
-
-x, y = next(iter(train_loader))
-print(x.shape, y.shape)
-
-# Model
-# ---------------------------------
+# ── Model ──
 
 class SqueezeExcitation(nn.Module):
                        # input_features, hidden_dim
     def __init__(self, input_features, expansion=0.25):
         super().__init__()
         self.hidden_size = max(1, int(input_features * expansion))
-        self.pool = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Flatten(1))
+        self.pool = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Flatten(1)) # Average pooling entire channel down to size 1, one scalar value
         self.fc = nn.Sequential(
                 nn.Linear(input_features, self.hidden_size, bias=False),
                 nn.GELU(),
@@ -287,12 +208,12 @@ class SqueezeExcitation(nn.Module):
         squeeze = self.pool(x)
         # (B, C)
         scale: torch.Tensor = self.fc(squeeze)
-        output = x * scale[:, :, None, None] # channel weighting
+        output = x * scale[:, :, None, None] # per channel weighting
         return output
 
 class PreNormalization(nn.Module):
     def __init__(
-            self, 
+            self,
             num_features,
             module: nn.Module,
             norm: nn.Module,
@@ -301,8 +222,8 @@ class PreNormalization(nn.Module):
         self.norm = norm(num_features)
         self.module = module
 
-    def forward(self, x, **kwargs):
-        return self.module(self.norm(x), **kwargs)
+    def forward(self, x):
+        return self.module(self.norm(x))
 
 class MBConv(nn.Module):
     def __init__(
@@ -314,7 +235,7 @@ class MBConv(nn.Module):
             downsample = False,
     ):
         super().__init__()
-        
+
         self.downsample = downsample
         self.hidden_dim = int(input_features * expansion_rate)
         self.stride = 2 if downsample else 1
@@ -322,17 +243,22 @@ class MBConv(nn.Module):
 
         if downsample:
             self.identity_pool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        else:
+            self.identity_pool = nn.Identity()
         if self.project or downsample:
             self.identity_proj = nn.Conv2d(input_features, output_features, kernel_size=1, stride=1, padding=0, bias=False)
+        else:
+            self.identity_proj = nn.Identity()
 
         self.conv = nn.Sequential(
                 nn.Conv2d(input_features, self.hidden_dim, kernel_size=1, stride=self.stride, padding=0, bias=False), # Expansion
                 nn.BatchNorm2d(self.hidden_dim),
                 nn.GELU(),
 
-                nn.Conv2d(self.hidden_dim, self.hidden_dim, kernel_size=3, stride=1, padding=1, groups=self.hidden_dim, bias=False), # depthwise convolution
+                nn.Conv2d(self.hidden_dim, self.hidden_dim, kernel_size=3, stride=1, padding=1, groups=self.hidden_dim, bias=False), # depthwise convolution, setting groups 
                 nn.BatchNorm2d(self.hidden_dim),
                 nn.GELU(),
+
                 SqueezeExcitation(self.hidden_dim, expansion=shrinkage_rate),
 
                 nn.Conv2d(self.hidden_dim, output_features, kernel_size=1, stride=1, padding=0, bias=False),
@@ -348,7 +274,7 @@ class MBConv(nn.Module):
         elif (self.project):
             identity = self.identity_proj(x)
         return identity + self.conv(x)
-        
+
 class RelativeMultiHeadAttention(nn.Module):
     def __init__(self, feat_size, input_features):
         super().__init__()
@@ -380,6 +306,7 @@ class RelativeMultiHeadAttention(nn.Module):
         rel[:, :, 0] += feat_size - 1                           # shift to [0, 2H-2]
         rel[:, :, 1] += feat_size - 1                           # shift to [0, 2W-2]
         rel_index = rel[:, :, 0] * (2 * feat_size - 1) + rel[:, :, 1]  # (N, N)
+
         self.register_buffer('relative_position_index', rel_index.long())
 
     def forward(self, x):
@@ -420,6 +347,7 @@ class TransformerDownsampleBlock(nn.Module):
         self.attn_proj = nn.Linear(input_features, output_features)
 
         self.ffn_norm = nn.LayerNorm(output_features)
+
         self.ffn = nn.Sequential(
                 nn.Linear(output_features, int(output_features * expansion_rate)),
                 nn.GELU(),
@@ -558,38 +486,6 @@ class CoAtNet0(nn.Module):
         return self.head(x)
 
 
-LOAD_BEST_MODEL = False
-
-model = CoAtNet0(num_classes=10) # ...) # what should num_classes be?
-
-if (LOAD_BEST_MODEL):
-    model.load_state_dict(torch.load("best_model.pt", weights_only=True))
-    model.eval()
-    print("Loaded saved best model!")
-
-model = model.to(DEVICE)
-
-criterion = nn.CrossEntropyLoss(label_smoothing=0.1)# ... # what might be a good loss function?
-val_criterion = nn.CrossEntropyLoss()
-
-# lr = 0.001
-# lr = 0.002
-# weight_decay = 0.003
-# epochs = 450
-# warm_up_period = 7
-# patience = 75
-# patience_delta = 0.0
-
-lr = 0.001
-weight_decay = 0.05
-epochs = 450
-warm_up_period = 7
-patience = 75
-patience_delta = 0.0
-
-
-# optimizer = torch.optim.Adam(model.parameters(), lr= # ...) # what might be a good learning rate?
-#                              # feel free to change the optimizer around.
 def get_decay_param_groups(model, weight_decay):
     decay = []
     disable_decay = []
@@ -617,28 +513,6 @@ def get_decay_param_groups(model, weight_decay):
     return [{"params": decay, "weight_decay": weight_decay},
           {"params": disable_decay, "weight_decay": 0.0}]
 
-# optimizer = torch.optim.AdamW(model.parameters(), lr, weight_decay=weight_decay)
-optimizer = torch.optim.AdamW(get_decay_param_groups(model, weight_decay=weight_decay), lr)
-
-# Learning rate scheduler
-# scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
-warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.05, total_iters=warm_up_period)
-cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs-warm_up_period)
-
-scheduler = torch.optim.lr_scheduler.SequentialLR(
-    optimizer,
-    schedulers=[warmup_scheduler, cosine_scheduler],
-    milestones=[warm_up_period],
-)
-
-train_losses = [] # Loss for each batch
-train_accuracies = [] # Accuracy for each epoch
-val_losses = [] # Loss for each batch
-val_accuracies = [] # Accuracy for each epoch
-
-checkpoint_dir = "checkpoints/sequence_scheduler_300"
-best_acc_path = os.path.join(checkpoint_dir, "best.pt")
-latest_path = os.path.join(checkpoint_dir, "last.pt")
 
 def save_checkpoint(path, model, optimizer, scheduler, epoch, best_val_acc, extra=None):
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -663,111 +537,3 @@ def load_checkpoint(path, model, optimizer, scheduler, device="cpu"):
     start_epoch = checkpoint.get("epoch", -1) + 1
     best_val_acc = checkpoint.get("best_val_acc", 0.0)
     return start_epoch, best_val_acc, checkpoint
-
-
-start_epoch = 0
-best_val_acc = 0.0
-failing_epochs = 0
-
-# resume_path = "checkpoints/sequence_scheduler/best.pt"
-resume_path = None
-
-if resume_path is not None:
-    start_epoch, best_val_acc, _ = load_checkpoint(
-        resume_path, model, optimizer, scheduler, device=DEVICE
-    )
-    print(f"Resuming from epoch {start_epoch}, best_val_acc={best_val_acc:.4f}")
-
-TRAIN = False
-
-if TRAIN:
-    for epoch in range(start_epoch, epochs):
-        print(f"Training Epoch {epoch}/{epochs}")
-        final_loss = None
-        total_count = 0
-        correct_count = 0
-        model.train()
-        for images, labels in train_loader:
-            images = images.to(DEVICE, non_blocking=True)
-            labels = labels.to(DEVICE, non_blocking=True)
-            if (labels.shape == (BATCH_SIZE,)):
-                labels = F.one_hot(labels, 10).float()
-            optimizer.zero_grad() # necessary for training
-            if len(train_losses) < 2:
-                print(f"Labels shape {labels.shape}")
-            outputs = model(images)
-            # loss = criterion(outputs.squeeze(), labels)
-            # loss = soft_target_cross_entropy(outputs, labels)
-            loss = F.cross_entropy(outputs, labels)
-
-            train_losses.append(loss.item())
-
-            loss.backward()
-            optimizer.step()
-
-            final_loss = loss.item()
-            correct_count += (outputs.argmax(dim=1) == labels.argmax(dim=1)).sum().item()
-            total_count += len(labels)
-        train_accuracies.append(correct_count/total_count)
-        print(f"Train loss: {final_loss}")
-        print(f"Train accuracy: {correct_count/total_count}")
-
-        final_loss = None
-        total_count = 0
-        total_loss_sum = 0
-        correct_count = 0
-        model.eval()
-
-        with torch.no_grad():
-            for images, labels in val_loader:
-                images = images.to(DEVICE, non_blocking=True)
-                labels = labels.to(DEVICE, non_blocking=True)
-
-                outputs = model(images)
-                # loss = val_criterion(outputs.squeeze(), labels)
-                # loss = soft_target_cross_entropy(outputs, labels)
-                loss = F.cross_entropy(outputs, labels)
-
-                total_loss_sum += loss.item() * len(labels)
-                correct_count += (outputs.argmax(dim=1) == labels).sum().item()
-                total_count += len(labels)
-
-        val_accuracies.append(correct_count/total_count)
-        final_loss = total_loss_sum/total_count
-        val_losses.append(final_loss)
-        print(f"Validation loss: {final_loss}")
-        print(f"Validation accuracy: {correct_count/total_count}")
-
-
-        if scheduler is not None:
-            scheduler.step()
-            print(f"Learning rate: {scheduler.get_last_lr()}")
-
-        val_acc = val_accuracies[-1]
-
-        if val_acc > (best_val_acc + patience_delta):
-            best_val_acc = val_acc
-            failing_epochs = 0
-            save_checkpoint(
-                best_acc_path,
-                model, optimizer, scheduler,
-                epoch=epoch,
-                best_val_acc=best_val_acc,
-                extra={"val_acc": val_acc}
-            )
-            print(f"Saved new best validation accuracy: {best_val_acc:.4f} at epoch {epoch}")
-        else:
-            failing_epochs += 1
-
-        save_checkpoint(
-            latest_path,
-            model, optimizer, scheduler,
-            epoch=epoch,
-            best_val_acc=best_val_acc,
-            extra={"val_acc": val_acc}
-        )
-
-        if failing_epochs >= patience:
-            print(f"Early stopping at epoch {epoch}, best={best_val_acc:.4f}")
-            break
-
