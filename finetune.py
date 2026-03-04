@@ -71,12 +71,17 @@ train_dataset = Subset(train_base, train_idx)
 val_dataset   = Subset(val_base,   val_idx)
 
 # ── MixUp / CutMix ──
+DISABLE_MIXUP_EPOCH = 90  # Set to an epoch number to disable MixUp/CutMix after that epoch, or None to keep it on
+
 mixup  = v2.MixUp(alpha=0.2, num_classes=NUM_CLASSES)
 cutmix = v2.CutMix(num_classes=NUM_CLASSES)
 cutmix_or_mixup = v2.RandomChoice([cutmix, mixup])
+use_mixup = True
 
 def collate_fn(batch):
-    return cutmix_or_mixup(*default_collate(batch))
+    if use_mixup:
+        return cutmix_or_mixup(*default_collate(batch))
+    return default_collate(batch)
 
 BATCH_SIZE  = 64
 NUM_WORKERS = 24
@@ -234,7 +239,11 @@ def train_one_epoch(model, ema_model, loader, optimizer, device, epoch_label):
         ema_model.update_parameters(model)
 
         loss_sum += loss.item() * images.size(0)
-        correct += (logits.argmax(1) == labels.argmax(1)).sum().item()
+        # MixUp/CutMix labels are soft (one-hot), hard labels are integers
+        if labels.ndim == 2:
+            correct += (logits.argmax(1) == labels.argmax(1)).sum().item()
+        else:
+            correct += (logits.argmax(1) == labels).sum().item()
         total += images.size(0)
         pbar.set_postfix(loss=f"{loss.item():.4f}")
 
@@ -344,6 +353,10 @@ if resume_path is not None:
         print(f"Resuming finetune from epoch {start_epoch}, best_val_acc={best_val_acc:.4f}")
 
 for epoch in range(start_epoch, epochs):
+    if DISABLE_MIXUP_EPOCH is not None and epoch >= DISABLE_MIXUP_EPOCH:
+        if use_mixup:
+            use_mixup = False
+            print(f"  MixUp/CutMix disabled at epoch {epoch+1}")
     label = f"Epoch {epoch+1}/{epochs}"
     train_loss, train_acc = train_one_epoch(model, ema_model, train_loader, optimizer, DEVICE, label)
     scheduler.step()
