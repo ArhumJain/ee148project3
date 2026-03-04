@@ -108,9 +108,6 @@ def make_tta_compose(mean, std, target=TARGET, fill=0):
             T.ColorJitter(brightness=0.15, contrast=0.2, saturation=0.1, hue=0.01)
         ], p=0.4),
 
-        # Random horizontal flip
-        T.RandomHorizontalFlip(p=0.5),
-
         T.ToTensor(),
         T.Normalize(mean=mean, std=std),
     ])
