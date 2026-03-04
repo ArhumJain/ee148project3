@@ -122,6 +122,12 @@ model = model.to(DEVICE)
 num_params = sum(p.numel() for p in model.parameters())
 print(f"CoAtNet-0 parameters: {num_params:,}")
 
+# ── EMA (Exponential Moving Average) ──
+from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
+
+EMA_DECAY = 0.999
+ema_model = AveragedModel(model, multi_avg_fn=get_ema_multi_avg_fn(EMA_DECAY))
+
 # ── Freeze backbone initially, then unfreeze ──
 # Phase 1: train only the new head (warmup_head_epochs)
 # Phase 2: unfreeze everything and finetune with lower LR
@@ -164,15 +170,16 @@ def get_decay_param_groups(model, weight_decay, lr):
     ]
 
 # ── Checkpointing ──
-checkpoint_dir = "checkpoints/finetune224"
+checkpoint_dir = "checkpoints/finetune224ema"
 best_path   = os.path.join(checkpoint_dir, "best.pt")
 latest_path = os.path.join(checkpoint_dir, "last.pt")
 
-def save_checkpoint(path, model, optimizer, scheduler, epoch, best_val_acc, phase, extra=None):
+def save_checkpoint(path, model, ema_model, optimizer, scheduler, epoch, best_val_acc, phase, extra=None):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     ckpt = {
         "epoch": epoch,
         "model": model.state_dict(),
+        "ema_model": ema_model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict() if scheduler is not None else None,
         "best_val_acc": best_val_acc,
@@ -182,9 +189,11 @@ def save_checkpoint(path, model, optimizer, scheduler, epoch, best_val_acc, phas
         ckpt.update(extra)
     torch.save(ckpt, path)
 
-def load_checkpoint(path, model, optimizer, scheduler, device):
+def load_checkpoint(path, model, ema_model, optimizer, scheduler, device):
     ckpt = torch.load(path, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model"])
+    if ema_model is not None and ckpt.get("ema_model") is not None:
+        ema_model.load_state_dict(ckpt["ema_model"])
     if optimizer is not None and ckpt.get("optimizer") is not None:
         optimizer.load_state_dict(ckpt["optimizer"])
     if scheduler is not None and ckpt.get("scheduler") is not None:
@@ -203,7 +212,7 @@ history = {
 history_path = os.path.join(checkpoint_dir, "history.json")
 
 # ── Training helpers ──
-def train_one_epoch(model, loader, optimizer, device, epoch_label):
+def train_one_epoch(model, ema_model, loader, optimizer, device, epoch_label):
     model.train()
     loss_sum = 0.0
     correct = 0
@@ -221,6 +230,8 @@ def train_one_epoch(model, loader, optimizer, device, epoch_label):
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
+
+        ema_model.update_parameters(model)
 
         loss_sum += loss.item() * images.size(0)
         correct += (logits.argmax(1) == labels.argmax(1)).sum().item()
@@ -248,43 +259,47 @@ def validate(model, loader, device, epoch_label):
     return loss_sum / total, correct / total
 
 
-# ═══════════════════════════════════════════════════════════════
-# Phase 1: Head-only warmup
-# ═══════════════════════════════════════════════════════════════
-print(f"\n{'='*60}")
-print(f"Phase 1: Head-only warmup ({WARMUP_HEAD_EPOCHS} epochs)")
-print(f"{'='*60}")
-
-freeze_backbone(model)
-head_optimizer = torch.optim.AdamW(
-    filter(lambda p: p.requires_grad, model.parameters()),
-    lr=head_lr, weight_decay=weight_decay
-)
+# ── Check if we should skip Phase 1 (already completed in a prior run) ──
+skip_phase1 = False
+if os.path.isfile(latest_path):
+    _ckpt = torch.load(latest_path, map_location="cpu", weights_only=False)
+    if _ckpt.get("phase") == "finetune":
+        skip_phase1 = True
+    del _ckpt
 
 best_val_acc = 0.0
 
-for epoch in range(WARMUP_HEAD_EPOCHS):
-    label = f"Epoch {epoch+1}/{WARMUP_HEAD_EPOCHS}"
-    train_loss, train_acc = train_one_epoch(model, train_loader, head_optimizer, DEVICE, label)
-    val_loss, val_acc = validate(model, val_loader, DEVICE, label)
+if skip_phase1:
+    print("\nPhase 1 already completed (resuming Phase 2). Skipping head warmup.")
+else:
+    # ═══════════════════════════════════════════════════════════════
+    # Phase 1: Head-only warmup
+    # ═══════════════════════════════════════════════════════════════
+    print(f"\n{'='*60}")
+    print(f"Phase 1: Head-only warmup ({WARMUP_HEAD_EPOCHS} epochs)")
+    print(f"{'='*60}")
 
-    history["train_loss"].append(train_loss)
-    history["train_acc"].append(train_acc)
-    history["val_loss"].append(val_loss)
-    history["val_acc"].append(val_acc)
-    history["lr"].append(head_lr)
-    history["phase"].append("head_warmup")
+    freeze_backbone(model)
+    head_optimizer = torch.optim.AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=head_lr, weight_decay=weight_decay
+    )
 
-    print(f"{label} | lr {head_lr:.2e} | "
-          f"train_loss {train_loss:.4f} | train_acc {train_acc:.4f} | "
-          f"val_loss {val_loss:.4f} | val_acc {val_acc:.4f}")
+    for epoch in range(WARMUP_HEAD_EPOCHS):
+        label = f"Epoch {epoch+1}/{WARMUP_HEAD_EPOCHS}"
+        train_loss, train_acc = train_one_epoch(model, ema_model, train_loader, head_optimizer, DEVICE, label)
+        val_loss, val_acc = validate(ema_model, val_loader, DEVICE, label)
 
-    if val_acc > best_val_acc:
-        best_val_acc = val_acc
-        save_checkpoint(best_path, model, head_optimizer, None,
-                        epoch=epoch, best_val_acc=best_val_acc, phase="head_warmup",
-                        extra={"val_acc": val_acc, "history": history})
-        print(f"  -> Saved new best (val_acc={val_acc:.4f})")
+        history["train_loss"].append(train_loss)
+        history["train_acc"].append(train_acc)
+        history["val_loss"].append(val_loss)
+        history["val_acc"].append(val_acc)
+        history["lr"].append(head_lr)
+        history["phase"].append("head_warmup")
+
+        print(f"{label} | lr {head_lr:.2e} | "
+              f"train_loss {train_loss:.4f} | train_acc {train_acc:.4f} | "
+              f"val_loss {val_loss:.4f} | val_acc {val_acc:.4f}")
 
 # ═══════════════════════════════════════════════════════════════
 # Phase 2: Full finetune
@@ -322,7 +337,7 @@ if resume_path is not None:
     saved_phase = ckpt_data.get("phase", "finetune")
     if saved_phase == "finetune":
         start_epoch, best_val_acc, _, saved_history = load_checkpoint(
-            resume_path, model, optimizer, scheduler, device=DEVICE
+            resume_path, model, ema_model, optimizer, scheduler, device=DEVICE
         )
         if saved_history is not None:
             history = saved_history
@@ -330,9 +345,9 @@ if resume_path is not None:
 
 for epoch in range(start_epoch, epochs):
     label = f"Epoch {epoch+1}/{epochs}"
-    train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, DEVICE, label)
+    train_loss, train_acc = train_one_epoch(model, ema_model, train_loader, optimizer, DEVICE, label)
     scheduler.step()
-    val_loss, val_acc = validate(model, val_loader, DEVICE, label)
+    val_loss, val_acc = validate(ema_model, val_loader, DEVICE, label)
     current_lr = scheduler.get_last_lr()[0]
 
     history["train_loss"].append(train_loss)
@@ -351,14 +366,14 @@ for epoch in range(start_epoch, epochs):
     if val_acc > (best_val_acc + patience_delta):
         best_val_acc = val_acc
         failing_epochs = 0
-        save_checkpoint(best_path, model, optimizer, scheduler,
+        save_checkpoint(best_path, model, ema_model, optimizer, scheduler,
                         epoch=epoch, best_val_acc=best_val_acc, phase="finetune",
                         extra=ckpt_extra)
         print(f"  -> Saved new best (val_acc={val_acc:.4f})")
     else:
         failing_epochs += 1
 
-    save_checkpoint(latest_path, model, optimizer, scheduler,
+    save_checkpoint(latest_path, model, ema_model, optimizer, scheduler,
                     epoch=epoch, best_val_acc=best_val_acc, phase="finetune",
                     extra=ckpt_extra)
 
