@@ -13,6 +13,7 @@ import matplotlib
 matplotlib.use('MacOSX')
 import matplotlib.pyplot as plt
 import matplotlib.image as image
+import types
 
 
 from main import (
@@ -233,5 +234,65 @@ def show_failures_from_json(path="failures.json", num_show=100, per_page=20):
     fig.tight_layout()
     plt.show()
 
+@torch.no_grad()
+def attention_heat_map(model, image_tensor, layer, upscale=False):
+    def patched_forward(self, x):
+        B, N, C = x.shape
+        q = self.W_q(x).reshape(B, N, self.num_heads, self.d_k).transpose(1, 2)
+        k = self.W_k(x).reshape(B, N, self.num_heads, self.d_k).transpose(1, 2)
+        v = self.W_v(x).reshape(B, N, self.num_heads, self.d_k).transpose(1, 2)
+
+        rel_bias = self.relative_bias_table[:, self.relative_position_index.view(-1)]
+        rel_bias = rel_bias.view(1, self.num_heads, N, N)
+
+        scale = self.d_k ** -0.5
+        attn = (q @ k.transpose(-2, -1)) * scale + rel_bias
+        attn = F.softmax(attn, dim=-1)
+
+        self._saved_attn = attn.detach()
+
+        out = attn @ v
+        out = out.transpose(1, 2).reshape(B, N, C)
+        return self.W_o(out)
+
+    original_forward = layer.attn.forward
+    layer.attn.forward = types.MethodType(patched_forward, layer.attn)
+    model(image_tensor)
+    layer.attn.forward = original_forward
+
+    matrix = layer.attn._saved_attn
+    attention_averages_map = torch.mean(matrix, dim=-2).reshape((matrix.shape[0], matrix.shape[1], int(matrix.shape[-1]**0.5), int(matrix.shape[-1]**0.5)))
+
+    avg_map = attention_averages_map[0].mean(dim=0).cpu().numpy()
+
+    img_display = image_tensor[0].cpu()
+    m = torch.tensor(mean).view(3, 1, 1)
+    s = torch.tensor(std).view(3, 1, 1)
+    img_display = (img_display * s + m).clamp(0, 1).permute(1, 2, 0).numpy()
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4))
+
+    ax1.imshow(img_display)
+    ax1.set_title("Input Image")
+    ax1.axis("off")
+
+    avg_map[0, 0] = avg_map.mean()
+    if upscale:
+        from PIL import Image as PILImage
+        import numpy as np
+        avg_map = np.array(PILImage.fromarray(
+            (avg_map / avg_map.max() * 255).astype('uint8')
+        ).resize((TARGET, TARGET), PILImage.BICUBIC))
+    ax2.imshow(avg_map, cmap="jet", interpolation="nearest")
+    ax2.set_title("Attention Map")
+    ax2.axis("off")
+
+    fig.tight_layout()
+    plt.show()
+
+    return attention_averages_map
+
+attention_heat_map(model, transformed_image, model.s3[0], True)
 # show_failures(model, items, final_tfms)
-show_failures_from_json()
+# show_failures_from_json()
+

@@ -1,4 +1,5 @@
 import torch
+from tqdm import tqdm
 from huggingface_hub import hf_hub_download
 from PIL import Image
 from torchvision import transforms
@@ -44,3 +45,31 @@ def load_predict_sample(
         print('='*100)
 
 load_predict_sample(loaded_pipeline)
+
+@torch.no_grad()
+def test_full_dataset(pipeline, items, batch_size=64):
+    """Run pipeline on all items in batches and report accuracy."""
+    correct = 0
+    total = len(items)
+
+    for i in tqdm(range(0, total, batch_size), desc="Testing pipeline"):
+        batch_items = items[i:i+batch_size]
+        tensors = []
+        labels = []
+        for path, label in batch_items:
+            img = Image.open(path)
+            tensor = transforms.ToTensor()(img.convert("RGB"))
+            tensors.append(pipeline.preprocess_layers(tensor).detach())
+            labels.append(label)
+            img.close()
+        batch = torch.stack(tensors)
+        preds = pipeline.forward(batch)
+        correct += (preds == torch.tensor(labels)).sum().item()
+        del batch, preds, tensors
+        torch.mps.empty_cache() if torch.backends.mps.is_available() else None
+
+    acc = correct / total
+    print(f"Full dataset accuracy: {acc:.4f} ({correct}/{total})")
+    return acc
+
+test_full_dataset(loaded_pipeline, items)
