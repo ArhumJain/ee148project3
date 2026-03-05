@@ -1,3 +1,4 @@
+import os
 import torch
 from tqdm import tqdm
 from huggingface_hub import hf_hub_download
@@ -6,12 +7,14 @@ from torchvision import transforms
 from create_pipeline import DigitClassifierPipeline
 from load_dataset import items
 import matplotlib.pyplot as plt
+from dotenv import load_dotenv
+load_dotenv()
 
 load_hf_info = {
-    'username': 'Isukali',
-    'token': 'REDACTED',
-    'repo_name': 'ee148a-project',
-    'filename': 'pipeline-vit.pt'
+    'username': os.environ['HF_USERNAME'],
+    'token': os.environ['HF_TOKEN'],
+    'repo_name': os.environ['HF_REPO_NAME'],
+    'filename': os.environ['HF_FILENAME'],
 }
 
 model_path = hf_hub_download(

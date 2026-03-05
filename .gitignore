@@ -2,3 +2,5 @@ data
 .DS_STore
 __pycache__
 pyproject.toml
+.env
+submission.json

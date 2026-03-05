@@ -12,6 +12,8 @@ from torchvision import transforms
 import os
 import json
 from tqdm import tqdm
+from dotenv import load_dotenv
+load_dotenv()
 import matplotlib
 matplotlib.use('MacOSX')
 import matplotlib.pyplot as plt
@@ -42,10 +44,10 @@ train_idx = perm[:num_train]
 val_idx   = perm[num_train:]
 
 hf_info = {
-    'username': 'Isukali',
-    'token': 'REDACTED',
-    'repo_name': 'ee148a-project',   # DON'T CHANGE
-    'filename': 'pipeline-vit.pt'    # DON'T CHANGE
+    'username': os.environ['HF_USERNAME'],
+    'token': os.environ['HF_TOKEN'],
+    'repo_name': os.environ['HF_REPO_NAME'],
+    'filename': os.environ['HF_FILENAME'],
 }
 
 class ResizeLongSide(nn.Module):
