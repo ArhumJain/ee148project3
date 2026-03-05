@@ -26,7 +26,6 @@ def load_predict_sample(
     pipeline: DigitClassifierPipeline,
     seed: int = None
 ):
-    # Assumes images and labels still exist
     import numpy as np
     if seed is not None:
         np.random.seed(seed)

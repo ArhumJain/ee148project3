@@ -50,26 +50,11 @@ def load_data_from_huggingface(dataset_name: str = HUGGINGFACE_DATASET) -> list[
     print(f"Loaded {len(dataset)} images from HuggingFace")
     return dataset
 
-# def load_data(data_dir: str) -> list[dict]:
-#     dataset: list[dict] = []
-#     filenames = [f for f in os.listdir(data_dir) if f.endswith('.jpg')]
-#     for f in filenames:
-#         path = os.path.join(data_dir, f)
-#         img = Image.open(path)
-#         label = int(path.split('_')[-1].replace('.jpg', '').replace('label', ''))
-#         dataset.append({
-#             'img': img,
-#             'label': label,
-#             'path': path,
-#         })
-#     return dataset
-
 def load_data(data_dir: str) -> list[dict]:
     items = []
     filenames = [f for f in os.listdir(data_dir) if f.endswith('.jpg')]
     for f in filenames:
         path = os.path.join(data_dir, f)
-        # img = Image.open(path)
         label = int(path.split('_')[-1].replace('.jpg', '').replace('label', ''))
         items.append((path, label))
     return items

@@ -72,7 +72,7 @@ prediction = torch.argmax(model(transformed_image), dim=1)
 plt.imshow(random_image)
 plt.title(f"True: {random_image_label}, Pred: {prediction[0]}")
 
-plt.show()
+# plt.show()
 
 
 def valaccPlots():
@@ -128,7 +128,6 @@ def valaccPlots():
 
 @torch.no_grad()
 def show_failures(model, items, transform, device=DEVICE, num_show=4):
-    """Go through all data, collect misclassified images, and display four of them."""
     model.eval()
     failures = []  # (image_path, true_label, predicted_label, confidence)
 
@@ -179,8 +178,6 @@ def show_failures(model, items, transform, device=DEVICE, num_show=4):
     plt.show()
 
 def show_failures_from_json(path="failures.json", num_show=100, per_page=20):
-    """Load failures from JSON and display in a paginated, scrollable viewer.
-    Navigate with arrow keys (left/right), scroll wheel, or 'q' to quit."""
     with open(path) as f:
         failures = json.load(f)
 
@@ -292,7 +289,30 @@ def attention_heat_map(model, image_tensor, layer, upscale=False):
 
     return attention_averages_map
 
-attention_heat_map(model, transformed_image, model.s3[0], True)
+def count_parameters(model):
+    total_parameters = 0
+    curr_stage = 0
+    curr_parameters = 0
+    is_head = False
+    for param_name, param in model.named_parameters():
+        if (("s" + str(curr_stage)) not in param_name) and not is_head:
+            print(param_name)
+            print(f"Stage {curr_stage} Parameters: {curr_parameters}")
+            curr_parameters = 0
+            curr_stage += 1
+            is_head = "head" in param_name
+        total_parameters += param.numel()
+        curr_parameters += param.numel()
+        # print(param_name, param.numel())
+    print(f"Head Parameters: {curr_parameters}")
+    print(f"Total Parameters: {total_parameters}")
+
+def print_model(model):
+    print(model)
+
+# count_parameters(model)
+# attention_heat_map(model, transformed_image, model.s3[0], True)
+# print_model(model)
 # show_failures(model, items, final_tfms)
 # show_failures_from_json()
-
+# valaccPlots()

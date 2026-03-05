@@ -1,8 +1,3 @@
-"""
-Continue pretraining CoAtNet-0 on Tiny ImageNet with a constant small LR.
-Picks up from the last checkpoint of the main pretrain run.
-"""
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -28,7 +23,6 @@ mps_available = torch.backends.mps.is_available()
 DEVICE = torch.device("cuda" if cuda_available else ("mps" if mps_available else "cpu"))
 print("Using device:", DEVICE)
 
-# ── Train / val split (same as pretrain.py) ──
 num_samples = len(items_tiny_imagenet)
 num_train = int(0.8 * num_samples)
 
@@ -37,7 +31,6 @@ perm = torch.randperm(num_samples, generator=g).tolist()
 train_idx = perm[:num_train]
 val_idx   = perm[num_train:]
 
-# ── Mean/std (paste cached values from pretrain run) ──
 mean = [0.4803381562232971, 0.4481699764728546, 0.39772674441337585]
 std  = [0.2714797258377075, 0.2638145983219147, 0.2768695056438446]
 
@@ -53,7 +46,6 @@ else:
     print(f"  mean = {mean}")
     print(f"  std  = {std}")
 
-# ── Transforms ──
 final_tfms   = make_final_compose(mean, std, target=TARGET)
 augment_tfms = make_augment_compose(mean, std, target=TARGET)
 
@@ -63,7 +55,6 @@ val_base   = ClassImages(items=items_tiny_imagenet, transform=final_tfms)
 train_dataset = Subset(train_base, train_idx)
 val_dataset   = Subset(val_base,   val_idx)
 
-# ── MixUp / CutMix ──
 NUM_CLASSES = 200
 mixup  = v2.MixUp(alpha=0.2, num_classes=NUM_CLASSES)
 cutmix = v2.CutMix(num_classes=NUM_CLASSES)
@@ -96,7 +87,6 @@ val_loader = DataLoader(
     pin_memory=False,
 )
 
-# ── Load checkpoint from main pretrain run ──
 source_dir = "checkpoints/pretrain_tiny_imagenet224"
 source_path = os.path.join(source_dir, "best.pt")
 
@@ -107,14 +97,12 @@ model.load_state_dict(ckpt["model"])
 prev_val_acc = ckpt.get("best_val_acc", ckpt.get("val_acc", 0.0))
 print(f"Loaded checkpoint from {source_path}, val_acc={prev_val_acc:.4f}")
 
-# ── Hyperparameters ──
 lr = 1e-4
 weight_decay = 0.05
 extra_epochs = 100
 patience = 70
 patience_delta = 0.0
 
-# ── Optimizer (no scheduler — constant LR) ──
 def get_decay_param_groups(model, weight_decay):
     decay = []
     no_decay = []
@@ -134,7 +122,6 @@ def get_decay_param_groups(model, weight_decay):
 
 optimizer = torch.optim.AdamW(get_decay_param_groups(model, weight_decay), lr=lr)
 
-# ── Checkpointing ──
 checkpoint_dir = "checkpoints/pretrain_tiny_imagenet224_extra"
 best_path   = os.path.join(checkpoint_dir, "best.pt")
 latest_path = os.path.join(checkpoint_dir, "last.pt")
@@ -151,7 +138,6 @@ def save_checkpoint(path, model, optimizer, epoch, best_val_acc, extra=None):
         ckpt.update(extra)
     torch.save(ckpt, path)
 
-# ── History (start fresh for the extra phase) ──
 history = {
     "train_loss": [],
     "train_acc": [],
@@ -161,7 +147,6 @@ history = {
 }
 history_path = os.path.join(checkpoint_dir, "history.json")
 
-# ── Resume from extra checkpoint if available ──
 start_epoch = 0
 best_val_acc = prev_val_acc
 failing_epochs = 0
@@ -177,7 +162,6 @@ if os.path.isfile(latest_path):
         history = rckpt["history"]
     print(f"Resuming extra training from epoch {start_epoch}, best_val_acc={best_val_acc:.4f}")
 
-# ── Training loop ──
 for epoch in range(start_epoch, extra_epochs):
     model.train()
     train_loss_sum = 0.0
@@ -205,7 +189,6 @@ for epoch in range(start_epoch, extra_epochs):
     train_acc = train_correct / train_total
     avg_train_loss = train_loss_sum / train_total
 
-    # ── Validate ──
     model.eval()
     val_loss_sum = 0.0
     val_correct = 0

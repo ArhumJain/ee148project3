@@ -188,8 +188,6 @@ def make_augment_compose(mean, std, target=TARGET, fill=0):
     ])
 
 
-# ── Model ──
-
 class SqueezeExcitation(nn.Module):
                        # input_features, hidden_dim
     def __init__(self, input_features, expansion=0.25):
@@ -203,10 +201,8 @@ class SqueezeExcitation(nn.Module):
                 nn.Sigmoid()
                 )
 
-    # x: (B, C, H, W)
     def forward(self, x):
         squeeze = self.pool(x)
-        # (B, C)
         scale: torch.Tensor = self.fc(squeeze)
         output = x * scale[:, :, None, None] # per channel weighting
         return output
@@ -278,8 +274,8 @@ class MBConv(nn.Module):
 class RelativeMultiHeadAttention(nn.Module):
     def __init__(self, feat_size, input_features):
         super().__init__()
-        self.d_model = input_features          # channel dimension, not spatial size
-        self.num_heads = self.d_model // 32    # head size = 32 (Table 3)
+        self.d_model = input_features
+        self.num_heads = self.d_model // 32
         self.d_k = 32
 
         self.W_q = nn.Linear(self.d_model, self.d_model, bias=True)
@@ -287,16 +283,11 @@ class RelativeMultiHeadAttention(nn.Module):
         self.W_v = nn.Linear(self.d_model, self.d_model, bias=True)
         self.W_o = nn.Linear(self.d_model, self.d_model, bias=True)
 
-        # Per-head relative position bias table P of size [(2H-1)*(2W-1)] (Appendix A.1)
-        # For square feature maps H=W=feat_size
         self.feat_size = feat_size
         num_rel = (2 * feat_size - 1) ** 2
         self.relative_bias_table = nn.Parameter(torch.zeros(self.num_heads, num_rel))
         nn.init.trunc_normal_(self.relative_bias_table, std=0.02)
 
-        # Precompute flat index into bias table for every (query_pos, key_pos) pair.
-        # Relative offset (i-i', j-j') is shifted by feat_size-1 to be non-negative,
-        # then encoded as a single integer: row_offset*(2*feat_size-1) + col_offset
         coords_h = torch.arange(feat_size)
         coords_w = torch.arange(feat_size)
         grid_h, grid_w = torch.meshgrid(coords_h, coords_w, indexing="ij")
@@ -310,19 +301,15 @@ class RelativeMultiHeadAttention(nn.Module):
         self.register_buffer('relative_position_index', rel_index.long())
 
     def forward(self, x):
-        # x: (B, N, C) where N = feat_size^2, C = d_model
         B, N, C = x.shape
 
         q = self.W_q(x).reshape(B, N, self.num_heads, self.d_k).transpose(1, 2)  # (B, H, N, d_k)
         k = self.W_k(x).reshape(B, N, self.num_heads, self.d_k).transpose(1, 2)
         v = self.W_v(x).reshape(B, N, self.num_heads, self.d_k).transpose(1, 2)
 
-        # Relative position bias: (num_heads, N, N) → (1, num_heads, N, N)
         rel_bias = self.relative_bias_table[:, self.relative_position_index.view(-1)]
         rel_bias = rel_bias.view(1, self.num_heads, N, N)
 
-        # F.scaled_dot_product_attention handles scaling, softmax, and matmul
-        # attn_mask is added to QK^T/sqrt(d_k) before softmax — exactly what we need
         out = F.scaled_dot_product_attention(q, k, v, attn_mask=rel_bias)
         out = out.transpose(1, 2).reshape(B, N, C)              # (B, N, C)
         return self.W_o(out)
@@ -355,35 +342,24 @@ class TransformerDownsampleBlock(nn.Module):
         )
 
     def forward(self, x):
-        # x: (B, C_in, H, W)
         B, C, H, W = x.shape
 
-        # Identity: Proj(Pool(x))
-        identity = self.identity_proj(self.pool(x))     # (B, C_out, H', W')
-        identity = identity.flatten(2).transpose(1, 2)  # (B, N, C_out)
+        identity = self.identity_proj(self.pool(x))
+        identity = identity.flatten(2).transpose(1, 2)
 
-        # Residual: Norm → Pool → Attention → Proj
-        res = x.flatten(2).transpose(1, 2)              # (B, H*W, C_in)
+        res = x.flatten(2).transpose(1, 2) 
         res = self.attn_norm(res)
         res = res.transpose(1, 2).reshape(B, C, H, W)
-        res = self.pool(res).flatten(2).transpose(1, 2) # (B, N, C_in)
-        res = self.attn_proj(self.attn(res))             # (B, N, C_out)
+        res = self.pool(res).flatten(2).transpose(1, 2)
+        res = self.attn_proj(self.attn(res))
 
         x = identity + res
 
-        # FFN
         x = x + self.ffn(self.ffn_norm(x))
-        return x                                         # (B, N, C_out)
+        return x
 
 
 class TransformerBlock(nn.Module):
-    """
-    Non-downsampling Transformer block. Operates entirely on (B, N, C) tensors
-    to avoid reshape overhead between consecutive blocks.
-
-    x ← x + Attention(Norm(x))
-    x ← x + FFN(Norm(x))
-    """
     def __init__(self, feat_size, dim, expansion_rate=4):
         super().__init__()
         self.attn_norm = nn.LayerNorm(dim)
@@ -397,33 +373,21 @@ class TransformerBlock(nn.Module):
         )
 
     def forward(self, x):
-        # x: (B, N, C)
         x = x + self.attn(self.attn_norm(x))
         x = x + self.ffn(self.ffn_norm(x))
         return x
 
 
 class CoAtNet0(nn.Module):
-    """
-    CoAtNet-0 (Table 3): C-C-T-T layout.
-    S0: 2-layer conv stem          (L=2, D=64)
-    S1: MBConv                     (L=2, D=96)
-    S2: MBConv                     (L=3, D=192)
-    S3: Transformer w/ rel-attn    (L=5, D=384)
-    S4: Transformer w/ rel-attn    (L=2, D=768)
-    ~25M params
-    """
     def __init__(self, num_classes=10, input_channels=3, image_size=128):
         super().__init__()
 
         dims    = [64, 96, 192, 384, 768]
         depths  = [2,  2,  3,   5,   2]
 
-        # Spatial sizes at each stage output (each stage halves resolution)
         s3_size = image_size // 16   # 8  for 128
         s4_size = image_size // 32   # 4  for 128
 
-        # S0: 2-layer convolutional stem (stride-2 on first conv → ½ spatial)
         self.s0 = nn.Sequential(
                 nn.Conv2d(input_channels, dims[0], kernel_size=3, stride=2, padding=1),
                 nn.BatchNorm2d(dims[0]),
@@ -433,32 +397,26 @@ class CoAtNet0(nn.Module):
                 nn.GELU(),
         )
 
-        # S1: MBConv (L=2, D=96)
         self.s1 = nn.Sequential(
                 MBConv(dims[0], dims[1], downsample=True),
                 *[MBConv(dims[1], dims[1]) for _ in range(depths[1] - 1)],
         )
 
-        # S2: MBConv (L=3, D=192)
         self.s2 = nn.Sequential(
                 MBConv(dims[1], dims[2], downsample=True),
                 *[MBConv(dims[2], dims[2]) for _ in range(depths[2] - 1)],
         )
 
-        # S3: Transformer (L=5, D=384)
-        # Downsample block: (B,C,H,W) → (B,N,C), then remaining blocks stay in (B,N,C)
         self.s3_down = TransformerDownsampleBlock(s3_size, dims[2], dims[3])
         self.s3 = nn.Sequential(
                 *[TransformerBlock(s3_size, dims[3]) for _ in range(depths[3] - 1)],
         )
 
-        # S4: Transformer (L=2, D=768)
         self.s4_down = TransformerDownsampleBlock(s4_size, dims[3], dims[4])
         self.s4 = nn.Sequential(
                 *[TransformerBlock(s4_size, dims[4]) for _ in range(depths[4] - 1)],
         )
 
-        # Classification head (Appendix A.1: global avg pool, no CLS token)
         self.s3_size = s3_size
         self.head = nn.Sequential(
                 nn.LayerNorm(dims[4]),
@@ -466,23 +424,19 @@ class CoAtNet0(nn.Module):
         )
 
     def forward(self, x):
-        # S0–S2: convolution stages, (B, C, H, W) throughout
         x = self.s0(x)
         x = self.s1(x)
-        x = self.s2(x)                                  # (B, 192, 16, 16)
+        x = self.s2(x)
 
-        # S3: downsample converts to (B, N, C), remaining blocks stay there
-        x = self.s3_down(x)                              # (B, 64, 384)
+        x = self.s3_down(x) 
         x = self.s3(x)
 
-        # S4: reshape back to (B, C, H, W) for the downsample block's Pool
         B, N, C = x.shape
         x = x.transpose(1, 2).reshape(B, C, self.s3_size, self.s3_size)
-        x = self.s4_down(x)                              # (B, 16, 768)
+        x = self.s4_down(x) 
         x = self.s4(x)
 
-        # Head: mean-pool over tokens, then classify
-        x = x.mean(dim=1)                               # (B, 768)
+        x = x.mean(dim=1)
         return self.head(x)
 
 

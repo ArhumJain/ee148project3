@@ -1,9 +1,3 @@
-"""
-Finetune CoAtNet-0 pretrained on Tiny ImageNet (200 classes) → target dataset (10 classes).
-Loads pretrained weights, replaces the classification head, and finetunes.
-Uses the same data pipeline as main.py.
-"""
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -30,11 +24,9 @@ mps_available = torch.backends.mps.is_available()
 DEVICE = torch.device("cuda" if cuda_available else ("mps" if mps_available else "cpu"))
 print("Using device:", DEVICE)
 
-# ── Config ──
 NUM_CLASSES = 10
 PRETRAINED_PATH = "checkpoints/pretrain_tiny_imagenet224/best.pt"
 
-# ── Train / val split (same 80/20 seeded split as main.py) ──
 num_samples = len(items)
 num_train = int(0.8 * num_samples)
 
@@ -60,7 +52,6 @@ else:
     print(f"  std  = {std}")
     print("  (paste these back into this file to skip recomputation)")
 
-# ── Transforms ──
 final_tfms   = make_final_compose(mean, std, target=TARGET)
 augment_tfms = make_augment_compose(mean, std, target=TARGET)
 
@@ -70,7 +61,6 @@ val_base   = ClassImages(items=items, transform=final_tfms)
 train_dataset = Subset(train_base, train_idx)
 val_dataset   = Subset(val_base,   val_idx)
 
-# ── MixUp / CutMix ──
 DISABLE_MIXUP_EPOCH = 90  # Set to an epoch number to disable MixUp/CutMix after that epoch, or None to keep it on
 
 mixup  = v2.MixUp(alpha=0.2, num_classes=NUM_CLASSES)
@@ -109,7 +99,6 @@ val_loader = DataLoader(
     prefetch_factor=4,
 )
 
-# ── Model: load pretrained, swap head ──
 model = CoAtNet0(num_classes=200, image_size=TARGET)  # match pretrained architecture
 
 ckpt = torch.load(PRETRAINED_PATH, map_location="cpu", weights_only=False)
@@ -117,7 +106,6 @@ model.load_state_dict(ckpt["model"])
 print(f"Loaded pretrained weights from {PRETRAINED_PATH}")
 print(f"  pretrain val_acc: {ckpt.get('best_val_acc', ckpt.get('val_acc', '?'))}")
 
-# Replace classification head: 200 → 10 classes
 model.head = nn.Sequential(
     nn.LayerNorm(768),
     nn.Linear(768, NUM_CLASSES),
@@ -127,7 +115,6 @@ model = model.to(DEVICE)
 num_params = sum(p.numel() for p in model.parameters())
 print(f"CoAtNet-0 parameters: {num_params:,}")
 
-# ── EMA (Exponential Moving Average) ──
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 
 EMA_DECAY = 0.999
@@ -147,16 +134,14 @@ def unfreeze_all(model):
     for param in model.parameters():
         param.requires_grad = True
 
-# ── Hyperparameters ──
-head_lr = 1e-3           # higher LR for randomly initialized head
-finetune_lr = 2e-4       # lower LR for pretrained backbone
+head_lr = 1e-3
+finetune_lr = 2e-4
 weight_decay = 0.05
 epochs = 400
-warm_up_period = 5       # LR warmup within finetune phase
+warm_up_period = 5
 patience = 100
 patience_delta = 0.0
 
-# ── Weight decay groups ──
 def get_decay_param_groups(model, weight_decay, lr):
     decay = []
     no_decay = []
@@ -174,7 +159,6 @@ def get_decay_param_groups(model, weight_decay, lr):
         {"params": no_decay, "weight_decay": 0.0, "lr": lr},
     ]
 
-# ── Checkpointing ──
 checkpoint_dir = "checkpoints/finetune224ema_mixoff"
 best_path   = os.path.join(checkpoint_dir, "best.pt")
 latest_path = os.path.join(checkpoint_dir, "last.pt")
@@ -205,7 +189,6 @@ def load_checkpoint(path, model, ema_model, optimizer, scheduler, device):
         scheduler.load_state_dict(ckpt["scheduler"])
     return ckpt.get("epoch", -1) + 1, ckpt.get("best_val_acc", 0.0), ckpt.get("phase", "finetune"), ckpt.get("history")
 
-# ── History ──
 history = {
     "train_loss": [],
     "train_acc": [],
@@ -216,7 +199,6 @@ history = {
 }
 history_path = os.path.join(checkpoint_dir, "history.json")
 
-# ── Training helpers ──
 def train_one_epoch(model, ema_model, loader, optimizer, device, epoch_label):
     model.train()
     loss_sum = 0.0
@@ -239,7 +221,6 @@ def train_one_epoch(model, ema_model, loader, optimizer, device, epoch_label):
         ema_model.update_parameters(model)
 
         loss_sum += loss.item() * images.size(0)
-        # MixUp/CutMix labels are soft (one-hot), hard labels are integers
         if labels.ndim == 2:
             correct += (logits.argmax(1) == labels.argmax(1)).sum().item()
         else:
@@ -268,7 +249,6 @@ def validate(model, loader, device, epoch_label):
     return loss_sum / total, correct / total
 
 
-# ── Check if we should skip Phase 1 (already completed in a prior run) ──
 skip_phase1 = False
 if os.path.isfile(latest_path):
     _ckpt = torch.load(latest_path, map_location="cpu", weights_only=False)
@@ -281,9 +261,6 @@ best_val_acc = 0.0
 if skip_phase1:
     print("\nPhase 1 already completed (resuming Phase 2). Skipping head warmup.")
 else:
-    # ═══════════════════════════════════════════════════════════════
-    # Phase 1: Head-only warmup
-    # ═══════════════════════════════════════════════════════════════
     print(f"\n{'='*60}")
     print(f"Phase 1: Head-only warmup ({WARMUP_HEAD_EPOCHS} epochs)")
     print(f"{'='*60}")
@@ -310,9 +287,6 @@ else:
               f"train_loss {train_loss:.4f} | train_acc {train_acc:.4f} | "
               f"val_loss {val_loss:.4f} | val_acc {val_acc:.4f}")
 
-# ═══════════════════════════════════════════════════════════════
-# Phase 2: Full finetune
-# ═══════════════════════════════════════════════════════════════
 print(f"\n{'='*60}")
 print(f"Phase 2: Full finetune ({epochs} epochs, patience={patience})")
 print(f"{'='*60}")
@@ -335,7 +309,6 @@ scheduler = torch.optim.lr_scheduler.SequentialLR(
     milestones=[warm_up_period],
 )
 
-# ── Resume from checkpoint if available ──
 start_epoch = 0
 failing_epochs = 0
 

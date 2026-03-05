@@ -1,9 +1,3 @@
-"""
-Pretrain CoAtNet-0 on Tiny ImageNet (200 classes).
-Mirrors the data pipeline from main.py: uniform resize + pad, compute mean/std,
-augmentation transforms, MixUp/CutMix, same dataloader setup.
-"""
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -29,7 +23,6 @@ mps_available = torch.backends.mps.is_available()
 DEVICE = torch.device("cuda" if cuda_available else ("mps" if mps_available else "cpu"))
 print("Using device:", DEVICE)
 
-# ── Train / val split (same 80/20 seeded split as main.py) ──
 num_samples = len(items_tiny_imagenet)
 num_train = int(0.8 * num_samples)
 
@@ -38,8 +31,6 @@ perm = torch.randperm(num_samples, generator=g).tolist()
 train_idx = perm[:num_train]
 val_idx   = perm[num_train:]
 
-# ── Compute mean/std on training split ──
-# Set to None to force recomputation, or paste cached values here
 mean = None
 std  = None
 
@@ -56,7 +47,6 @@ else:
     print(f"  std  = {std}")
     print("  (paste these back into this file to skip recomputation)")
 
-# ── Transforms ──
 final_tfms   = make_final_compose(mean, std, target=TARGET)
 augment_tfms = make_augment_compose(mean, std, target=TARGET)
 
@@ -66,7 +56,6 @@ val_base   = ClassImages(items=items_tiny_imagenet, transform=final_tfms)
 train_dataset = Subset(train_base, train_idx)
 val_dataset   = Subset(val_base,   val_idx)
 
-# ── MixUp / CutMix (200 classes for Tiny ImageNet) ──
 NUM_CLASSES = 200
 mixup  = v2.MixUp(alpha=0.2, num_classes=NUM_CLASSES)
 cutmix = v2.CutMix(num_classes=NUM_CLASSES)
@@ -99,12 +88,10 @@ val_loader = DataLoader(
     pin_memory=True,
 )
 
-# ── Model ──
 model = CoAtNet0(num_classes=NUM_CLASSES, image_size=TARGET).to(DEVICE)
 num_params = sum(p.numel() for p in model.parameters())
 print(f"CoAtNet-0 parameters: {num_params:,}")
 
-# ── Hyperparameters ──
 lr = 1e-3
 weight_decay = 0.05
 epochs = 200
@@ -112,8 +99,6 @@ warm_up_period = 5
 patience = 70
 patience_delta = 0.0
 
-# ── Optimizer with proper weight decay groups ──
-# Don't decay biases or normalization layer parameters
 def get_decay_param_groups(model, weight_decay):
     decay = []
     no_decay = []
@@ -133,7 +118,6 @@ def get_decay_param_groups(model, weight_decay):
 
 optimizer = torch.optim.AdamW(get_decay_param_groups(model, weight_decay), lr=lr)
 
-# ── LR schedule: linear warmup → cosine decay ──
 warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
     optimizer, start_factor=0.05, total_iters=warm_up_period
 )
@@ -146,7 +130,6 @@ scheduler = torch.optim.lr_scheduler.SequentialLR(
     milestones=[warm_up_period],
 )
 
-# ── Checkpointing ──
 checkpoint_dir = "checkpoints/pretrain_tiny_imagenet224"
 best_path   = os.path.join(checkpoint_dir, "best.pt")
 latest_path = os.path.join(checkpoint_dir, "last.pt")
@@ -173,7 +156,6 @@ def load_checkpoint(path, model, optimizer, scheduler, device):
         scheduler.load_state_dict(ckpt["scheduler"])
     return ckpt.get("epoch", -1) + 1, ckpt.get("best_val_acc", 0.0), ckpt.get("history")
 
-# ── Epoch history ──
 history = {
     "train_loss": [],
     "train_acc": [],
@@ -183,7 +165,6 @@ history = {
 }
 history_path = os.path.join(checkpoint_dir, "history.json")
 
-# ── Resume from checkpoint if available ──
 start_epoch = 0
 best_val_acc = 0.0
 failing_epochs = 0
@@ -198,9 +179,7 @@ if resume_path is not None:
         history = saved_history
     print(f"Resuming from epoch {start_epoch}, best_val_acc={best_val_acc:.4f}")
 
-# ── Training loop ──
 for epoch in range(start_epoch, epochs):
-    # ── Train ──
     model.train()
     train_loss_sum = 0.0
     train_correct = 0
@@ -229,7 +208,6 @@ for epoch in range(start_epoch, epochs):
     train_acc = train_correct / train_total
     avg_train_loss = train_loss_sum / train_total
 
-    # ── Validate ──
     model.eval()
     val_loss_sum = 0.0
     val_correct = 0
@@ -249,7 +227,6 @@ for epoch in range(start_epoch, epochs):
     avg_val_loss = val_loss_sum / val_total
     current_lr = scheduler.get_last_lr()[0]
 
-    # ── Record history ──
     history["train_loss"].append(avg_train_loss)
     history["train_acc"].append(train_acc)
     history["val_loss"].append(avg_val_loss)
@@ -261,7 +238,6 @@ for epoch in range(start_epoch, epochs):
           f"train_loss {avg_train_loss:.4f} | train_acc {train_acc:.4f} | "
           f"val_loss {avg_val_loss:.4f} | val_acc {val_acc:.4f}")
 
-    # ── Checkpointing ──
     ckpt_extra = {"val_acc": val_acc, "history": history}
 
     if val_acc > (best_val_acc + patience_delta):
@@ -278,7 +254,6 @@ for epoch in range(start_epoch, epochs):
                     epoch=epoch, best_val_acc=best_val_acc,
                     extra=ckpt_extra)
 
-    # Save history as standalone JSON for easy plotting without loading the checkpoint
     with open(history_path, "w") as f:
         json.dump(history, f, indent=2)
 

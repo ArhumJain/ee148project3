@@ -1,14 +1,3 @@
-"""
-Download Tiny ImageNet (100K images, 200 classes, 64x64) and build (filepath, label)
-items in the same format as load_dataset.py.
-
-Structure after extraction:
-    data/tiny-imagenet-200/
-        train/  → 200 folders (n01443537, …), each with 500 images
-        val/    → images/ folder + val_annotations.txt
-        test/   → images/ folder (no labels, unused)
-"""
-
 import os
 import zipfile
 import urllib.request
@@ -92,7 +81,6 @@ def load_tiny_imagenet_items():
     return all_items
 
 
-# When imported, produce the items list
 items_tiny_imagenet = load_tiny_imagenet_items()
 print(f"[tiny-imagenet] Loaded {len(items_tiny_imagenet)} items, 200 classes.")
 print(items_tiny_imagenet)
