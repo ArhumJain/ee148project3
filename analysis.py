@@ -1,82 +1,47 @@
-from PIL import Image
-from numpy import transpose
-import torch
 import random
-import torch.nn as nn
-import torch.nn.functional as F
-from torchvision.transforms import RandomOrder, v2
-from torch.utils.data import DataLoader, Subset, default_collate
-import os
 import json
+import types
+import os
+
+import torch
+import torch.nn.functional as F
+from PIL import Image
 from tqdm import tqdm
 import matplotlib
 matplotlib.use('MacOSX')
 import matplotlib.pyplot as plt
-import matplotlib.image as image
-import types
-
-
-from main import (
-    ClassImages,
-    CoAtNet0,
-    TransformerDownsampleBlock,
-    load_checkpoint,
-    make_uniform_compose,
-    compute_mean_std,
-    get_or_compute_mean_std,
-    make_final_compose,
-    make_augment_compose,
-    TARGET,
-)
 
 from load_dataset import items
-
-cuda_available = torch.cuda.is_available()
-mps_available = torch.backends.mps.is_available()
-DEVICE = torch.device("cuda" if cuda_available else ("mps" if mps_available else "cpu"))
-print("Using device:", DEVICE)
+from config import TARGET, DATASET_MEAN, DATASET_STD, DEVICE
+from model import CoAtNet0
+from transforms import make_final_compose
+from training import load_checkpoint
 
 checkpoint_path = "checkpoints/finetune224ema/best.pt"
 
 model = CoAtNet0(num_classes=10, image_size=TARGET)
-load_checkpoint(checkpoint_path, model, optimizer=None, scheduler=None)
+load_checkpoint(checkpoint_path, model)
 model = model.to(DEVICE)
 model.eval()
 
-# ── Train / val split (same 80/20 seeded split as main.py) ──
-num_samples = len(items)
-num_train = int(0.8 * num_samples)
+mean = DATASET_MEAN
+std = DATASET_STD
+final_tfms = make_final_compose(mean, std, target=TARGET)
 
-g = torch.Generator().manual_seed(42)
-perm = torch.randperm(num_samples, generator=g).tolist()
-ids = perm
-train_idx = perm[:num_train]
-# val_idx   = perm[num_train:]
-random_image_id = perm[random.randint(0, len(perm))]
-
-print(items[random_image_id])
-
+# quick sanity check on a random image
+random_image_id = random.randint(0, len(items) - 1)
 random_image_path, random_image_label = items[random_image_id]
-
 random_image = Image.open(random_image_path)
 
-mean = [0.5462899804115295, 0.5005961060523987, 0.45557186007499695]
-std  = [0.25494423508644104, 0.24657973647117615, 0.24912121891975403]
-
-final_tfms = make_final_compose(mean, std, target=TARGET)
 transformed_image = final_tfms(random_image)
-
-transformed_image = transformed_image[None, :, :, :].to(DEVICE) # batch size 1
+transformed_image = transformed_image[None, :, :, :].to(DEVICE)
 prediction = torch.argmax(model(transformed_image), dim=1)
 
 plt.imshow(random_image)
 plt.title(f"True: {random_image_label}, Pred: {prediction[0]}")
 
-# plt.show()
-
 
 def valaccPlots():
-    # ── Training history plots ──
     checkpoint_dirs = [
         ("Pretrain Tiny ImageNet (128)", "checkpoints/pretrain_tiny_imagenet"),
         ("Pretrain Tiny ImageNet (224)", "checkpoints/pretrain_tiny_imagenet224"),
@@ -98,7 +63,6 @@ def valaccPlots():
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
         fig.suptitle(name, fontsize=14, fontweight="bold")
 
-        # Loss plot
         ax1.plot(epochs, h["train_loss"], label="Train Loss")
         ax1.plot(epochs, h["val_loss"], label="Val Loss")
         ax1.set_xlabel("Epoch")
@@ -107,7 +71,6 @@ def valaccPlots():
         ax1.legend()
         ax1.grid(True, alpha=0.3)
 
-        # Accuracy plot
         ax2.plot(epochs, h["train_acc"], label="Train Acc")
         ax2.plot(epochs, h["val_acc"], label="Val Acc")
         ax2.set_xlabel("Epoch")
@@ -129,7 +92,7 @@ def valaccPlots():
 @torch.no_grad()
 def show_failures(model, items, transform, device=DEVICE, num_show=4):
     model.eval()
-    failures = []  # (image_path, true_label, predicted_label, confidence)
+    failures = []
 
     for path, label in tqdm(items, desc="Scanning for failures"):
         img = Image.open(path)
@@ -146,11 +109,8 @@ def show_failures(model, items, transform, device=DEVICE, num_show=4):
     print(f"\nTotal: {len(items)}, Failures: {len(failures)}, "
           f"Accuracy: {1 - len(failures)/len(items):.4f}")
 
-    # Write all failures to JSON
-    failures_json = [
-        {"path": p, "true": t, "pred": pr}
-        for p, t, pr, _ in failures
-    ]
+    # dump all failures to json for later inspection
+    failures_json = [{"path": p, "true": t, "pred": pr} for p, t, pr, _ in failures]
     with open("failures.json", "w") as f:
         json.dump(failures_json, f, indent=2)
     print(f"Wrote {len(failures)} failures to failures.json")
@@ -176,6 +136,7 @@ def show_failures(model, items, transform, device=DEVICE, num_show=4):
 
     fig.tight_layout()
     plt.show()
+
 
 def show_failures_from_json(path="failures.json", num_show=100, per_page=20):
     with open(path) as f:
@@ -231,8 +192,11 @@ def show_failures_from_json(path="failures.json", num_show=100, per_page=20):
     fig.tight_layout()
     plt.show()
 
+
 @torch.no_grad()
 def attention_heat_map(model, image_tensor, layer, upscale=False):
+    # monkey-patch forward to capture attention weights
+    # (F.scaled_dot_product_attention hides them, so we compute manually)
     def patched_forward(self, x):
         B, N, C = x.shape
         q = self.W_q(x).reshape(B, N, self.num_heads, self.d_k).transpose(1, 2)
@@ -245,11 +209,9 @@ def attention_heat_map(model, image_tensor, layer, upscale=False):
         scale = self.d_k ** -0.5
         attn = (q @ k.transpose(-2, -1)) * scale + rel_bias
         attn = F.softmax(attn, dim=-1)
-
         self._saved_attn = attn.detach()
 
-        out = attn @ v
-        out = out.transpose(1, 2).reshape(B, N, C)
+        out = (attn @ v).transpose(1, 2).reshape(B, N, C)
         return self.W_o(out)
 
     original_forward = layer.attn.forward
@@ -258,10 +220,14 @@ def attention_heat_map(model, image_tensor, layer, upscale=False):
     layer.attn.forward = original_forward
 
     matrix = layer.attn._saved_attn
-    attention_averages_map = torch.mean(matrix, dim=-2).reshape((matrix.shape[0], matrix.shape[1], int(matrix.shape[-1]**0.5), int(matrix.shape[-1]**0.5)))
+    feat_size = int(matrix.shape[-1] ** 0.5)
 
-    avg_map = attention_averages_map[0].mean(dim=0).cpu().numpy()
+    # average over queries to get "how much attention does each spatial position receive"
+    avg_map = torch.mean(matrix, dim=-2).reshape(
+        matrix.shape[0], matrix.shape[1], feat_size, feat_size
+    )[0].mean(dim=0).cpu().numpy()
 
+    # undo normalization for display
     img_display = image_tensor[0].cpu()
     m = torch.tensor(mean).view(3, 1, 1)
     s = torch.tensor(std).view(3, 1, 1)
@@ -273,13 +239,16 @@ def attention_heat_map(model, image_tensor, layer, upscale=False):
     ax1.set_title("Input Image")
     ax1.axis("off")
 
+    # top-left token tends to be an attention sink — replace with mean for cleaner viz
     avg_map[0, 0] = avg_map.mean()
+
     if upscale:
         from PIL import Image as PILImage
         import numpy as np
         avg_map = np.array(PILImage.fromarray(
             (avg_map / avg_map.max() * 255).astype('uint8')
         ).resize((TARGET, TARGET), PILImage.BICUBIC))
+
     ax2.imshow(avg_map, cmap="jet", interpolation="nearest")
     ax2.set_title("Attention Map")
     ax2.axis("off")
@@ -287,7 +256,8 @@ def attention_heat_map(model, image_tensor, layer, upscale=False):
     fig.tight_layout()
     plt.show()
 
-    return attention_averages_map
+    return matrix
+
 
 def count_parameters(model):
     total_parameters = 0
@@ -303,16 +273,5 @@ def count_parameters(model):
             is_head = "head" in param_name
         total_parameters += param.numel()
         curr_parameters += param.numel()
-        # print(param_name, param.numel())
     print(f"Head Parameters: {curr_parameters}")
     print(f"Total Parameters: {total_parameters}")
-
-def print_model(model):
-    print(model)
-
-# count_parameters(model)
-# attention_heat_map(model, transformed_image, model.s3[0], True)
-# print_model(model)
-# show_failures(model, items, final_tfms)
-# show_failures_from_json()
-# valaccPlots()

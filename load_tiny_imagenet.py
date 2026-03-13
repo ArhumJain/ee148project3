@@ -83,4 +83,3 @@ def load_tiny_imagenet_items():
 
 items_tiny_imagenet = load_tiny_imagenet_items()
 print(f"[tiny-imagenet] Loaded {len(items_tiny_imagenet)} items, 200 classes.")
-print(items_tiny_imagenet)

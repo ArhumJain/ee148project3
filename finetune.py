@@ -1,138 +1,64 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torchvision.transforms import v2
-from torch.utils.data import DataLoader, Subset, default_collate
 import os
 import json
-from tqdm import tqdm
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, Subset, default_collate
+from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 
 from load_dataset import items
-from main import (
-    ClassImages,
-    CoAtNet0,
-    make_uniform_compose,
-    compute_mean_std,
-    get_or_compute_mean_std,
-    make_final_compose,
-    make_augment_compose,
-    TARGET,
-)
+from config import TARGET, DATASET_MEAN, DATASET_STD, DEVICE
+from model import CoAtNet0
+from transforms import make_final_compose, make_augment_compose
+from data import ClassImages, split_indices, make_mixup_collate
+from training import get_decay_param_groups, save_checkpoint, load_checkpoint, train_one_epoch, validate
 
-cuda_available = torch.cuda.is_available()
-mps_available = torch.backends.mps.is_available()
-DEVICE = torch.device("cuda" if cuda_available else ("mps" if mps_available else "cpu"))
 print("Using device:", DEVICE)
 
+# --- data ---
+
 NUM_CLASSES = 10
-PRETRAINED_PATH = "checkpoints/pretrain_tiny_imagenet224/best.pt"
+train_idx, val_idx = split_indices(len(items))
 
-num_samples = len(items)
-num_train = int(0.8 * num_samples)
-
-g = torch.Generator().manual_seed(42)
-perm = torch.randperm(num_samples, generator=g).tolist()
-train_idx = perm[:num_train]
-val_idx   = perm[num_train:]
-
-# ── Compute mean/std on training split ──
-mean = None
-std  = None
-
-if mean is not None and std is not None:
-    print("Using cached mean/std.")
-else:
-    print("Computing mean/std ...")
-    uniform_only = make_uniform_compose(TARGET)
-    stats_dataset = ClassImages(items=items, transform=uniform_only)
-    subset_for_stats = Subset(stats_dataset, train_idx)
-    mean, std = compute_mean_std(subset_for_stats, batch_size=256,
-                                  num_workers=4, device=str(DEVICE))
-    print(f"  mean = {mean}")
-    print(f"  std  = {std}")
-    print("  (paste these back into this file to skip recomputation)")
-
-final_tfms   = make_final_compose(mean, std, target=TARGET)
-augment_tfms = make_augment_compose(mean, std, target=TARGET)
-
-train_base = ClassImages(items=items, transform=augment_tfms)
-val_base   = ClassImages(items=items, transform=final_tfms)
-
-train_dataset = Subset(train_base, train_idx)
-val_dataset   = Subset(val_base,   val_idx)
-
-DISABLE_MIXUP_EPOCH = 90  # Set to an epoch number to disable MixUp/CutMix after that epoch, or None to keep it on
-
-mixup  = v2.MixUp(alpha=0.2, num_classes=NUM_CLASSES)
-cutmix = v2.CutMix(num_classes=NUM_CLASSES)
-cutmix_or_mixup = v2.RandomChoice([cutmix, mixup])
+# mixup can be toggled off mid-training
+mixup_collate = make_mixup_collate(NUM_CLASSES)
 use_mixup = True
+DISABLE_MIXUP_EPOCH = 90
 
 def collate_fn(batch):
     if use_mixup:
-        return cutmix_or_mixup(*default_collate(batch))
+        return mixup_collate(batch)
     return default_collate(batch)
 
-BATCH_SIZE  = 64
-NUM_WORKERS = 24
+train_dataset = Subset(ClassImages(items, transform=make_augment_compose(DATASET_MEAN, DATASET_STD)), train_idx)
+val_dataset = Subset(ClassImages(items, transform=make_final_compose(DATASET_MEAN, DATASET_STD)), val_idx)
 
 train_loader = DataLoader(
-    train_dataset,
-    batch_size=BATCH_SIZE,
-    shuffle=True,
-    num_workers=NUM_WORKERS,
-    collate_fn=collate_fn,
-    persistent_workers=True,
-    drop_last=True,
-    pin_memory=True,
-    prefetch_factor=4,
+    train_dataset, batch_size=64, shuffle=True,
+    num_workers=24, collate_fn=collate_fn,
+    persistent_workers=True, drop_last=True, pin_memory=True, prefetch_factor=4,
 )
-
 val_loader = DataLoader(
-    val_dataset,
-    batch_size=BATCH_SIZE,
-    shuffle=False,
-    num_workers=NUM_WORKERS,
-    persistent_workers=True,
-    drop_last=False,
-    pin_memory=True,
-    prefetch_factor=4,
+    val_dataset, batch_size=64, shuffle=False,
+    num_workers=24, persistent_workers=True, pin_memory=True, prefetch_factor=4,
 )
 
-model = CoAtNet0(num_classes=200, image_size=TARGET)  # match pretrained architecture
+# --- load pretrained model, swap head for 10 classes ---
 
+PRETRAINED_PATH = "checkpoints/pretrain_tiny_imagenet224/best.pt"
+
+model = CoAtNet0(num_classes=200, image_size=TARGET)
 ckpt = torch.load(PRETRAINED_PATH, map_location="cpu", weights_only=False)
 model.load_state_dict(ckpt["model"])
 print(f"Loaded pretrained weights from {PRETRAINED_PATH}")
 print(f"  pretrain val_acc: {ckpt.get('best_val_acc', ckpt.get('val_acc', '?'))}")
 
-model.head = nn.Sequential(
-    nn.LayerNorm(768),
-    nn.Linear(768, NUM_CLASSES),
-)
+model.head = nn.Sequential(nn.LayerNorm(768), nn.Linear(768, NUM_CLASSES))
 model = model.to(DEVICE)
+print(f"CoAtNet-0 parameters: {sum(p.numel() for p in model.parameters()):,}")
 
-num_params = sum(p.numel() for p in model.parameters())
-print(f"CoAtNet-0 parameters: {num_params:,}")
+ema_model = AveragedModel(model, multi_avg_fn=get_ema_multi_avg_fn(0.999))
 
-from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
-
-EMA_DECAY = 0.999
-ema_model = AveragedModel(model, multi_avg_fn=get_ema_multi_avg_fn(EMA_DECAY))
-
-# ── Freeze backbone initially, then unfreeze ──
-# Phase 1: train only the new head (warmup_head_epochs)
-# Phase 2: unfreeze everything and finetune with lower LR
-WARMUP_HEAD_EPOCHS = 3
-
-def freeze_backbone(model):
-    for name, param in model.named_parameters():
-        if not name.startswith("head."):
-            param.requires_grad = False
-
-def unfreeze_all(model):
-    for param in model.parameters():
-        param.requires_grad = True
+# --- hyperparams ---
 
 head_lr = 1e-3
 finetune_lr = 2e-4
@@ -140,115 +66,17 @@ weight_decay = 0.05
 epochs = 400
 warm_up_period = 5
 patience = 100
-patience_delta = 0.0
-
-def get_decay_param_groups(model, weight_decay, lr):
-    decay = []
-    no_decay = []
-    norm_classes = (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d, nn.LayerNorm)
-    for module in model.modules():
-        for param_name, param in module.named_parameters(recurse=False):
-            if not param.requires_grad:
-                continue
-            if param_name.endswith("bias") or isinstance(module, norm_classes):
-                no_decay.append(param)
-            else:
-                decay.append(param)
-    return [
-        {"params": decay, "weight_decay": weight_decay, "lr": lr},
-        {"params": no_decay, "weight_decay": 0.0, "lr": lr},
-    ]
+WARMUP_HEAD_EPOCHS = 3
 
 checkpoint_dir = "checkpoints/finetune224ema_mixoff"
-best_path   = os.path.join(checkpoint_dir, "best.pt")
+best_path = os.path.join(checkpoint_dir, "best.pt")
 latest_path = os.path.join(checkpoint_dir, "last.pt")
-
-def save_checkpoint(path, model, ema_model, optimizer, scheduler, epoch, best_val_acc, phase, extra=None):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    ckpt = {
-        "epoch": epoch,
-        "model": model.state_dict(),
-        "ema_model": ema_model.state_dict(),
-        "optimizer": optimizer.state_dict(),
-        "scheduler": scheduler.state_dict() if scheduler is not None else None,
-        "best_val_acc": best_val_acc,
-        "phase": phase,
-    }
-    if extra is not None:
-        ckpt.update(extra)
-    torch.save(ckpt, path)
-
-def load_checkpoint(path, model, ema_model, optimizer, scheduler, device):
-    ckpt = torch.load(path, map_location=device, weights_only=False)
-    model.load_state_dict(ckpt["model"])
-    if ema_model is not None and ckpt.get("ema_model") is not None:
-        ema_model.load_state_dict(ckpt["ema_model"])
-    if optimizer is not None and ckpt.get("optimizer") is not None:
-        optimizer.load_state_dict(ckpt["optimizer"])
-    if scheduler is not None and ckpt.get("scheduler") is not None:
-        scheduler.load_state_dict(ckpt["scheduler"])
-    return ckpt.get("epoch", -1) + 1, ckpt.get("best_val_acc", 0.0), ckpt.get("phase", "finetune"), ckpt.get("history")
-
-history = {
-    "train_loss": [],
-    "train_acc": [],
-    "val_loss": [],
-    "val_acc": [],
-    "lr": [],
-    "phase": [],
-}
 history_path = os.path.join(checkpoint_dir, "history.json")
 
-def train_one_epoch(model, ema_model, loader, optimizer, device, epoch_label):
-    model.train()
-    loss_sum = 0.0
-    correct = 0
-    total = 0
+history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": [], "lr": [], "phase": []}
+best_val_acc = 0.0
 
-    pbar = tqdm(loader, desc=f"{epoch_label} [train]", leave=False)
-    for images, labels in pbar:
-        images = images.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
-
-        logits = model(images)
-        loss = F.cross_entropy(logits, labels)
-
-        optimizer.zero_grad()
-        loss.backward()
-        nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
-
-        ema_model.update_parameters(model)
-
-        loss_sum += loss.item() * images.size(0)
-        if labels.ndim == 2:
-            correct += (logits.argmax(1) == labels.argmax(1)).sum().item()
-        else:
-            correct += (logits.argmax(1) == labels).sum().item()
-        total += images.size(0)
-        pbar.set_postfix(loss=f"{loss.item():.4f}")
-
-    return loss_sum / total, correct / total
-
-@torch.no_grad()
-def validate(model, loader, device, epoch_label):
-    model.eval()
-    loss_sum = 0.0
-    correct = 0
-    total = 0
-
-    for images, labels in tqdm(loader, desc=f"{epoch_label} [val]", leave=False):
-        images = images.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
-
-        logits = model(images)
-        loss_sum += F.cross_entropy(logits, labels).item() * images.size(0)
-        correct += (logits.argmax(1) == labels).sum().item()
-        total += images.size(0)
-
-    return loss_sum / total, correct / total
-
-
+# check if phase 1 was already done
 skip_phase1 = False
 if os.path.isfile(latest_path):
     _ckpt = torch.load(latest_path, map_location="cpu", weights_only=False)
@@ -256,7 +84,9 @@ if os.path.isfile(latest_path):
         skip_phase1 = True
     del _ckpt
 
-best_val_acc = 0.0
+# ============================================================
+# Phase 1: freeze backbone, train only the new head
+# ============================================================
 
 if skip_phase1:
     print("\nPhase 1 already completed (resuming Phase 2). Skipping head warmup.")
@@ -265,15 +95,18 @@ else:
     print(f"Phase 1: Head-only warmup ({WARMUP_HEAD_EPOCHS} epochs)")
     print(f"{'='*60}")
 
-    freeze_backbone(model)
+    for name, param in model.named_parameters():
+        if not name.startswith("head."):
+            param.requires_grad = False
+
     head_optimizer = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
-        lr=head_lr, weight_decay=weight_decay
+        lr=head_lr, weight_decay=weight_decay,
     )
 
     for epoch in range(WARMUP_HEAD_EPOCHS):
         label = f"Epoch {epoch+1}/{WARMUP_HEAD_EPOCHS}"
-        train_loss, train_acc = train_one_epoch(model, ema_model, train_loader, head_optimizer, DEVICE, label)
+        train_loss, train_acc = train_one_epoch(model, train_loader, head_optimizer, DEVICE, label, ema_model=ema_model)
         val_loss, val_acc = validate(ema_model, val_loader, DEVICE, label)
 
         history["train_loss"].append(train_loss)
@@ -287,51 +120,47 @@ else:
               f"train_loss {train_loss:.4f} | train_acc {train_acc:.4f} | "
               f"val_loss {val_loss:.4f} | val_acc {val_acc:.4f}")
 
+# ============================================================
+# Phase 2: unfreeze everything, finetune with cosine schedule
+# ============================================================
+
 print(f"\n{'='*60}")
 print(f"Phase 2: Full finetune ({epochs} epochs, patience={patience})")
 print(f"{'='*60}")
 
-unfreeze_all(model)
-optimizer = torch.optim.AdamW(
-    get_decay_param_groups(model, weight_decay, lr=finetune_lr),
-    lr=finetune_lr
-)
+for param in model.parameters():
+    param.requires_grad = True
 
-warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
-    optimizer, start_factor=0.1, total_iters=warm_up_period
+optimizer = torch.optim.AdamW(
+    get_decay_param_groups(model, weight_decay, lr=finetune_lr), lr=finetune_lr,
 )
-cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-    optimizer, T_max=epochs - warm_up_period
-)
+warmup_sched = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.1, total_iters=warm_up_period)
+cosine_sched = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs - warm_up_period)
 scheduler = torch.optim.lr_scheduler.SequentialLR(
-    optimizer,
-    schedulers=[warmup_scheduler, cosine_scheduler],
-    milestones=[warm_up_period],
+    optimizer, schedulers=[warmup_sched, cosine_sched], milestones=[warm_up_period],
 )
 
 start_epoch = 0
-failing_epochs = 0
-
-resume_path = latest_path if os.path.isfile(latest_path) else None
-
-if resume_path is not None:
-    ckpt_data = torch.load(resume_path, map_location=DEVICE, weights_only=False)
-    saved_phase = ckpt_data.get("phase", "finetune")
-    if saved_phase == "finetune":
-        start_epoch, best_val_acc, _, saved_history = load_checkpoint(
-            resume_path, model, ema_model, optimizer, scheduler, device=DEVICE
+if os.path.isfile(latest_path):
+    _ckpt = torch.load(latest_path, map_location="cpu", weights_only=False)
+    if _ckpt.get("phase") == "finetune":
+        start_epoch, best_val_acc, rckpt = load_checkpoint(
+            latest_path, model, optimizer, scheduler, ema_model=ema_model, device=DEVICE,
         )
-        if saved_history is not None:
-            history = saved_history
+        if rckpt.get("history"):
+            history = rckpt["history"]
         print(f"Resuming finetune from epoch {start_epoch}, best_val_acc={best_val_acc:.4f}")
+    del _ckpt
 
+failing_epochs = 0
 for epoch in range(start_epoch, epochs):
-    if DISABLE_MIXUP_EPOCH is not None and epoch >= DISABLE_MIXUP_EPOCH:
-        if use_mixup:
-            use_mixup = False
-            print(f"  MixUp/CutMix disabled at epoch {epoch+1}")
+    # turn off mixup late in training
+    if DISABLE_MIXUP_EPOCH is not None and epoch >= DISABLE_MIXUP_EPOCH and use_mixup:
+        use_mixup = False
+        print(f"  MixUp/CutMix disabled at epoch {epoch+1}")
+
     label = f"Epoch {epoch+1}/{epochs}"
-    train_loss, train_acc = train_one_epoch(model, ema_model, train_loader, optimizer, DEVICE, label)
+    train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, DEVICE, label, ema_model=ema_model)
     scheduler.step()
     val_loss, val_acc = validate(ema_model, val_loader, DEVICE, label)
     current_lr = scheduler.get_last_lr()[0]
@@ -347,22 +176,19 @@ for epoch in range(start_epoch, epochs):
           f"train_loss {train_loss:.4f} | train_acc {train_acc:.4f} | "
           f"val_loss {val_loss:.4f} | val_acc {val_acc:.4f}")
 
-    ckpt_extra = {"val_acc": val_acc, "history": history}
+    extra = {"val_acc": val_acc, "history": history, "phase": "finetune"}
 
-    if val_acc > (best_val_acc + patience_delta):
+    if val_acc > best_val_acc:
         best_val_acc = val_acc
         failing_epochs = 0
-        save_checkpoint(best_path, model, ema_model, optimizer, scheduler,
-                        epoch=epoch, best_val_acc=best_val_acc, phase="finetune",
-                        extra=ckpt_extra)
+        save_checkpoint(best_path, model, optimizer, scheduler, epoch=epoch,
+                        best_val_acc=best_val_acc, ema_model=ema_model, extra=extra)
         print(f"  -> Saved new best (val_acc={val_acc:.4f})")
     else:
         failing_epochs += 1
 
-    save_checkpoint(latest_path, model, ema_model, optimizer, scheduler,
-                    epoch=epoch, best_val_acc=best_val_acc, phase="finetune",
-                    extra=ckpt_extra)
-
+    save_checkpoint(latest_path, model, optimizer, scheduler, epoch=epoch,
+                    best_val_acc=best_val_acc, ema_model=ema_model, extra=extra)
     with open(history_path, "w") as f:
         json.dump(history, f, indent=2)
 
@@ -371,5 +197,3 @@ for epoch in range(start_epoch, epochs):
         break
 
 print(f"\nFinetuning complete. Best val_acc: {best_val_acc:.4f}")
-print(f"Best weights: {best_path}")
-print(f"History:      {history_path}")
